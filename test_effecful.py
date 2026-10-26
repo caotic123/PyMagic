@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 import MagicF
+from MagicF.compile import PACKAGE_INIT, write_package
 from MagicF import (
     BrokenVariant, MissedModelObject, RunningUnstatedModel, UncompilableModel,
     Compilation, Model, collect_magic, compile_models, constraint, get_models, magic, model, run_model,
@@ -828,47 +829,91 @@ def test_magic_of_several_kinds():
 
 # ------------------------------------------------------------------ compiling
 
-CHECKER_SOURCE = """\
-# compiled from MagicF models for a model checker, which supplies magic()
+def checked(name, kinds, function, indent="    "):
+    # the assert of magic(kinds)'s value in a module compiled for a model checker, flagged with a BrokenVariant
+    kind = f"({kinds})" if ", " in kinds else kinds
+    return (f"{indent}assert isinstance({name}, {kind}), BrokenVariant(f'{name} = magic({kinds}) drew {{{name}!r}}, "
+            f"which is not {kinds.replace(', ', ' or ')}: the model of {function} rejected this call')\n")
 
 
-def randint(min, max):
-    x = magic(int)
-    assert isinstance(x, int)
-    assert min <= x <= max
-    return x
+def holds(condition, function, indent="    "):
+    # the assert of constraint(condition) in a module compiled for a model checker, flagged with a BrokenVariant
+    return (f"{indent}assert {condition}, BrokenVariant('the values broke {condition}: the model of {function} "
+            f"rejected this call')\n")
 
 
-def input(prompt=''):
-    x = magic(str)
-    assert isinstance(x, str)
-    return x
+BROKEN_VARIANT_CLASS = """\
+class BrokenVariant(BaseException):
+    # magic() values the original couldn't give: the model rejects the call they make
+    pass
 """
 
-CONCRETE_SOURCE = """\
+def compiled(models, compilation, module=None):
+    # the source of the module the models compile to, or of the one standing in for module
+    files = {path: source for path, source in compile_models(models, compilation).items()
+             if path != "__init__.py" and source != PACKAGE_INIT}
+    if module is None:
+        (source,) = files.values()
+        return source
+    return files[module.replace(".", "/") + ".py"]
+
+
+def run_compiled(models, compilation, namespace, files=None):
+    # each module the models compile to, run in one namespace
+    for path, source in (files or compile_models(models, compilation)).items():
+        if path != "__init__.py":
+            exec(source, namespace)
+    return namespace
+
+
+CHECKER_HEADER = (
+    "# compiled from MagicF models for a model checker, which supplies magic()\n"
+    "# magic() values breaking a constraint fail its assert with a BrokenVariant\n"
+)
+
+CHECKER_SOURCES = {
+    "random.py": CHECKER_HEADER + "\n\n" + BROKEN_VARIANT_CLASS + "\n\n"
+    "def randint(min, max):\n    x = magic(int)\n" + checked("x", "int", "randint") + holds("min <= x <= max", "randint")
+    + "    return x\n",
+    "builtins.py": CHECKER_HEADER + "\n\n" + BROKEN_VARIANT_CLASS + "\n\n"
+    "def input(prompt=''):\n    x = magic(str)\n" + checked("x", "str", "input") + "    return x\n",
+}
+
+CONCRETE_SOURCES = {
+    "random.py": """\
 # compiled from MagicF models, with the real effects in place of magic()
-import builtins
 import random
+
+
+_real_randint = random.randint
 
 
 def randint(min, max):
     try:
-        x = random.randint(min, max)
+        x = _real_randint(min, max)
     except Exception as _error:
         raise AssertionError(f'the real randint raised {_error!r}, which its model never raises') from _error
     assert isinstance(x, int)
     assert min <= x <= max
     return x
+""",
+    "builtins.py": """\
+# compiled from MagicF models, with the real effects in place of magic()
+import builtins
+
+
+_real_input = builtins.input
 
 
 def input(prompt=''):
     try:
-        x = builtins.input(prompt)
+        x = _real_input(prompt)
     except Exception as _error:
         raise AssertionError(f'the real input raised {_error!r}, which its model never raises') from _error
     assert isinstance(x, str)
     return x
-"""
+""",
+}
 
 
 def real_call_block(target, call, name, allowed=None):
@@ -893,41 +938,92 @@ def unpack_block(names, name):
 
 
 def test_compile_for_a_model_checker():
-    assert compile_models(models, Compilation.MODEL_CHECKER) == CHECKER_SOURCE
+    files = compile_models(models, Compilation.MODEL_CHECKER)
+    assert {path: files[path] for path in CHECKER_SOURCES} == CHECKER_SOURCES
+    assert set(files) == {"__init__.py", *CHECKER_SOURCES}
 
 
 def test_compile_concrete():
-    assert compile_models(models, Compilation.CONCRETE) == CONCRETE_SOURCE
+    files = compile_models(models, Compilation.CONCRETE)
+    assert {path: files[path] for path in CONCRETE_SOURCES} == CONCRETE_SOURCES
+    assert set(files) == {"__init__.py", *CONCRETE_SOURCES}
 
 
 def test_model_checker_source_runs_with_a_supplied_magic():
-    namespace = {"magic": lambda kind: 4}
-    exec(compile_models(models, Compilation.MODEL_CHECKER), namespace)
+    namespace = run_compiled(models, Compilation.MODEL_CHECKER, {"magic": lambda kind: 4})
     assert namespace["randint"](1, 6) == 4
-    with pytest.raises(AssertionError):
+    with pytest.raises(AssertionError) as broken:
         namespace["randint"](5, 6)
+    assert isinstance(broken.value.args[0], namespace["BrokenVariant"])
+    assert str(broken.value) == "the values broke min <= x <= max: the model of randint rejected this call"
+    namespace["magic"] = lambda kind: "4"
+    with pytest.raises(AssertionError, match="x = magic\\(int\\) drew '4', which is not int") as broken:
+        namespace["randint"](1, 6)
+    assert isinstance(broken.value.args[0], namespace["BrokenVariant"])
+
+
+def test_model_checker_source_flags_only_its_constraints():
+    # the model's own asserts and the concrete ones aren't BrokenVariants
+    assert all("BrokenVariant" not in source for source in compile_models(models, Compilation.CONCRETE).values())
+    assert "class BrokenVariant" not in compiled([model_ping], Compilation.MODEL_CHECKER)
+
+
+def picked(value):
+    return value
+
+
+@model(picked)
+def model_picked(value):
+    x = magic()
+    if x is None:
+        raise BrokenVariant("nothing to pick")
+    return x
+
+
+def test_model_raising_broken_variant_itself_gets_the_compiled_one():
+    checker = compiled([model_picked], Compilation.MODEL_CHECKER)
+    assert BROKEN_VARIANT_CLASS in checker and "import" not in checker
+    namespace = {"magic": lambda: None}
+    exec(checker, namespace)
+    with pytest.raises(namespace["BrokenVariant"], match="nothing to pick"):
+        namespace["picked"](1)
+
+
+def test_model_using_another_broken_variant_is_not_compiled(tmp_path, monkeypatch):
+    (tmp_path / "own_broken_variant.py").write_text(
+        "from MagicF import magic, model\n\n"
+        "class BrokenVariant(Exception):\n    pass\n\n"
+        "def judged(value):\n    return value\n\n"
+        "@model(judged)\n"
+        "def model_judged(value):\n    x = magic(int)\n    if x < 0:\n        raise BrokenVariant(x)\n    return x\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from own_broken_variant import model_judged
+    with pytest.raises(UncompilableModel, match="uses a BrokenVariant of its own"):
+        compiled([model_judged], Compilation.MODEL_CHECKER)
 
 
 def test_concrete_source_runs_the_real_effect_and_asserts_the_model():
-    namespace = {}
-    exec(compile_models(models, Compilation.CONCRETE), namespace)
+    # the compiled module takes the real effect as it finds it when it's run
+    files = compile_models(models, Compilation.CONCRETE)
+    namespace = run_compiled(models, Compilation.CONCRETE, {}, files)
     assert all(1 <= namespace["randint"](1, 6) <= 6 for _ in range(50))
     with mock.patch.object(builtins, "input", lambda prompt="": "typed"):
-        assert namespace["input"]("name? ") == "typed"
+        assert run_compiled(models, Compilation.CONCRETE, {}, files)["input"]("name? ") == "typed"
     with mock.patch.object(builtins, "input", lambda prompt="": 42):
         with pytest.raises(AssertionError):
-            namespace["input"]("name? ")
+            run_compiled(models, Compilation.CONCRETE, {}, files)["input"]("name? ")
 
 
 def test_compile_several_magic_values():
-    checker = compile_models([model_divide], Compilation.MODEL_CHECKER)
+    checker = compiled([model_divide], Compilation.MODEL_CHECKER)
     assert (
-        "    q = magic(int)\n    assert isinstance(q, int)\n    r = magic(int)\n    assert isinstance(r, int)\n"
-        "    assert q * b + r == a and 0 <= r < b\n    return (q, r)\n"
+        "    q = magic(int)\n" + checked("q", "int", "divide") + "    r = magic(int)\n" + checked("r", "int", "divide")
+        + holds("q * b + r == a and 0 <= r < b", "divide") + "    return (q, r)\n"
     ) in checker
-    concrete = compile_models([model_divide], Compilation.CONCRETE)
+    concrete = compiled([model_divide], Compilation.CONCRETE)
     assert (
-        real_call_block("_result", "test_effecful.divide(a, b)", "divide") + unpack_block("q, r", "divide")
+        real_call_block("_result", "_real_divide(a, b)", "divide") + unpack_block("q, r", "divide")
         + "    assert isinstance(q, int)\n    assert isinstance(r, int)\n"
         "    assert q * b + r == a and 0 <= r < b\n    return (q, r)\n"
     ) in concrete
@@ -937,9 +1033,9 @@ def test_compile_several_magic_values():
 
 
 def test_concrete_compile_unpacks_returned_magic_values():
-    concrete = compile_models([model_pair_alone], Compilation.CONCRETE)
+    concrete = compiled([model_pair_alone], Compilation.CONCRETE)
     assert (
-        "def pair(a, b):\n" + real_call_block("_result", "test_effecful.pair(a, b)", "pair")
+        "def pair(a, b):\n" + real_call_block("_result", "_real_pair(a, b)", "pair")
         + unpack_block("x, y", "pair") + "    return (x, y)\n"
     ) in concrete
     namespace = {}
@@ -948,10 +1044,10 @@ def test_concrete_compile_unpacks_returned_magic_values():
 
 
 def test_compile_model_without_magic():
-    assert "def ping():\n    return 'pong'\n" in compile_models([model_ping], Compilation.MODEL_CHECKER)
-    concrete = compile_models([model_ping], Compilation.CONCRETE)
+    assert "def ping():\n    return 'pong'\n" in compiled([model_ping], Compilation.MODEL_CHECKER)
+    concrete = compiled([model_ping], Compilation.CONCRETE)
     assert (
-        "def ping():\n" + real_call_block("_result", "test_effecful.ping()", "ping")
+        "def ping():\n" + real_call_block("_result", "_real_ping()", "ping")
         + "    assert 'pong' == _result\n    return _result\n"
     ) in concrete
     namespace = {}
@@ -968,31 +1064,67 @@ def test_concrete_compile_asserts_a_computed_result():
     def model_inc_wrong(a):
         return a + 2
 
-    concrete = compile_models([model_inc_computed], Compilation.CONCRETE)
+    concrete = compiled([model_inc_computed], Compilation.CONCRETE)
     assert (
-        real_call_block("_result", "test_effecful.inc(a)", "inc") + "    assert a + 1 == _result\n    return _result\n"
+        real_call_block("_result", "_real_inc(a)", "inc") + "    assert a + 1 == _result\n    return _result\n"
     ) in concrete
     namespace = {}
     exec(concrete, namespace)
     assert namespace["inc"](4) == 5
 
     namespace = {}
-    exec(compile_models([model_inc_wrong], Compilation.CONCRETE), namespace)
+    exec(compiled([model_inc_wrong], Compilation.CONCRETE), namespace)
     with pytest.raises(AssertionError):
         namespace["inc"](4)
 
 
-def test_compile_imports_the_module_level_names_a_model_uses():
-    checker = compile_models([model_cap], Compilation.MODEL_CHECKER)
-    assert "from test_effecful import LIMIT\n" in checker
-    assert "def cap(value):\n    x = magic(int)\n    assert isinstance(x, int)\n    assert x <= LIMIT\n    return x\n" in checker
+def test_compile_class_model_for_a_model_checker():
+    assert "class Dog:\n\n    def speak(self):\n        return 'meow'\n" in compiled([_model_Dog], Compilation.MODEL_CHECKER)
+
+
+def test_compile_copies_under_their_originals_names():
+    checker = compiled([_model_ask], Compilation.MODEL_CHECKER)
+    assert "\n\nclass Refused(Exception):\n    # a copy of Refused, which the model raises in its place\n" in checker
+    assert "@model" not in checker and "RefusedCopy" not in checker
+    assert "raise Refused(f'{question} no', 403) from KeyError(question)" in checker
+
+
+def installed(files, tmp_path, script, before=""):
+    # what a script prints in a Python that runs before, then imports the compiled package, with magic() drawing 4
+    import subprocess
+    write_package(files, tmp_path / "compiled")
+    preamble = f"import builtins\nbuiltins.magic = lambda *kinds: 4\n{before}import compiled\n"
+    run = subprocess.run([sys.executable, "-c", preamble + script], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    return run.stdout.split()
+
+
+def test_installing_the_package_puts_the_models_in_place_of_the_originals(tmp_path):
+    files = compile_models(models, Compilation.MODEL_CHECKER)
+    # randint was imported from random before installing, and is the model too
+    script = "print(random.randint.__module__, randint.__module__, builtins.input.__module__, randint(1, 6))"
+    assert installed(files, tmp_path, script, before="import random\nfrom random import randint\n") == \
+        ["compiled.random", "compiled.random", "compiled.builtins", "4"]
+
+
+def test_installing_a_concrete_package_keeps_the_real_effects_it_calls(tmp_path):
+    files = compile_models(models, Compilation.CONCRETE)
+    script = "import random\nprint(random.randint.__module__, all(1 <= random.randint(1, 6) <= 6 for _ in range(20)))"
+    assert installed(files, tmp_path, script) == ["compiled.random", "True"]
+
+
+def test_compile_writes_out_the_module_level_names_a_model_uses():
+    checker = compiled([model_cap], Compilation.MODEL_CHECKER)
+    assert "\n\nLIMIT = 100\n" in checker and "import" not in checker
+    assert "def cap(value):\n    x = magic(int)\n" + checked("x", "int", "cap") + holds("x <= LIMIT", "cap") + \
+        "    return x\n" in checker
 
 
 def test_compile_magic_in_a_loop():
-    checker = compile_models([model_dice], Compilation.MODEL_CHECKER)
+    checker = compiled([model_dice], Compilation.MODEL_CHECKER)
     assert (
-        "    for _ in range(n):\n        x = magic(int)\n        assert isinstance(x, int)\n        assert 1 <= x <= 6\n"
-        "        rolls.append(x)\n"
+        "    for _ in range(n):\n        x = magic(int)\n" + checked("x", "int", "dice", "        ")
+        + holds("1 <= x <= 6", "dice", "        ") + "        rolls.append(x)\n"
         "    return rolls\n"
     ) in checker
     draws = itertools.count(1)
@@ -1003,9 +1135,9 @@ def test_compile_magic_in_a_loop():
     with pytest.raises(AssertionError):
         namespace["dice"](4)
 
-    concrete = compile_models([model_dice], Compilation.CONCRETE)
+    concrete = compiled([model_dice], Compilation.CONCRETE)
     assert (
-        real_call_block("_result", "test_effecful.dice(n)", "dice")
+        real_call_block("_result", "_real_dice(n)", "dice")
         + "    _magic = _elements(_result, 'dice')\n    rolls = []\n    for _ in range(n):\n"
         "        x = next(_magic)\n        assert isinstance(x, int)\n        assert 1 <= x <= 6\n"
         "        rolls.append(x)\n    assert rolls == _result\n    return _result\n"
@@ -1017,7 +1149,7 @@ def test_compile_magic_in_a_loop():
 
 
 def test_compiled_loop_draws_like_the_running_model():
-    checker = compile_models([_model_roll], Compilation.MODEL_CHECKER)
+    checker = compiled([_model_roll], Compilation.MODEL_CHECKER)
     draws = iter([10, 20, 30, 40, 50])
     namespace = {"magic": lambda kind: next(draws)}
     exec(checker, namespace)
@@ -1026,7 +1158,7 @@ def test_compiled_loop_draws_like_the_running_model():
 
 
 def test_compile_magic_in_expressions():
-    checker = compile_models([_model_inc], Compilation.MODEL_CHECKER)
+    checker = compiled([_model_inc], Compilation.MODEL_CHECKER)
     assert "    x = magic() + 1\n    values = [magic()]\n    y = z = magic()\n" in checker
     namespace = {"magic": iter([10, 20, 30]).__next__}
     exec(checker, namespace)
@@ -1034,62 +1166,62 @@ def test_compile_magic_in_expressions():
 
 
 def test_compile_keeps_the_exceptions_a_model_raises():
-    checker = compile_models([model_request], Compilation.MODEL_CHECKER)
+    checker = compiled([model_request], Compilation.MODEL_CHECKER)
     assert (
-        "    status_code = magic(int)\n    assert isinstance(status_code, int)\n    assert 100 <= status_code <= 599\n"
-        "    if status_code == 404:\n"
+        "    status_code = magic(int)\n" + checked("status_code", "int", "request")
+        + holds("100 <= status_code <= 599", "request") + "    if status_code == 404:\n"
         "        raise NotFound(f'{url} was not found')\n    return status_code\n"
     ) in checker
-    assert "from test_effecful import NotFound\n" in checker
+    assert "\n\nclass NotFound(Exception):\n    pass\n" in checker and "import" not in checker
 
 
 def test_concrete_compile_checks_exceptions_against_the_model():
-    concrete = compile_models([model_request], Compilation.CONCRETE)
-    assert real_call_block("status_code", "test_effecful.request(url)", "request", allowed="NotFound") in concrete
-    namespace = {}
-    exec(concrete, namespace)
-    compiled_request = namespace["request"]
+    concrete = compiled([model_request], Compilation.CONCRETE)
+    assert real_call_block("status_code", "_real_request(url)", "request", allowed="NotFound") in concrete
 
-    assert compiled_request("https://example.com") == 200
+    def compiled_request(real):
+        # the compiled request, run where the real request is real
+        with mock.patch.object(THIS_MODULE, "request", real):
+            namespace = {}
+            exec(concrete, namespace)
+        return namespace["request"]
 
-    with mock.patch.object(THIS_MODULE, "request", lambda url: 404):
-        with pytest.raises(AssertionError, match=r"the real request returned 404, but its model raises NotFound\("):
-            compiled_request("https://example.com")
+    assert compiled_request(request)("https://example.com") == 200
+
+    with pytest.raises(AssertionError, match=r"the real request returned 404, but its model raises NotFound\("):
+        compiled_request(lambda url: 404)("https://example.com")
 
     def not_found(url):
         raise NotFound(url)
 
-    with mock.patch.object(THIS_MODULE, "request", not_found):
-        with pytest.raises(NotFound):
-            compiled_request("https://example.com")
+    with pytest.raises(NotFound):
+        compiled_request(not_found)("https://example.com")
 
     def broken(url):
         raise KeyError("boom")
 
-    with mock.patch.object(THIS_MODULE, "request", broken):
-        with pytest.raises(AssertionError, match=r"the real request raised KeyError\('boom'\), which its model never raises"):
-            compiled_request("https://example.com")
+    with pytest.raises(AssertionError, match=r"the real request raised KeyError\('boom'\), which its model never raises"):
+        compiled_request(broken)("https://example.com")
 
 
 def test_concrete_compile_runs_the_real_effect_before_the_model_raises():
     namespace = {}
-    exec(compile_models([model_randint_with_empty_range], Compilation.CONCRETE), namespace)
+    exec(compiled([model_randint_with_empty_range], Compilation.CONCRETE), namespace)
     assert 1 <= namespace["randint"](1, 6) <= 6
     with pytest.raises(ValueError, match="empty range"):
         namespace["randint"](6, 1)
 
-    namespace = {}
-    exec(compile_models(models, Compilation.CONCRETE), namespace)
+    namespace = run_compiled(models, Compilation.CONCRETE, {})
     with pytest.raises(AssertionError, match=r"the real randint raised ValueError\(.*which its model never raises"):
         namespace["randint"](6, 1)
 
 
 def test_compile_magic_of_several_kinds():
-    checker = compile_models([model_identifier], Compilation.MODEL_CHECKER)
-    assert "    y = magic(str, int)\n    assert isinstance(y, (str, int))\n    return y\n" in checker
-    concrete = compile_models([model_identifier], Compilation.CONCRETE)
+    checker = compiled([model_identifier], Compilation.MODEL_CHECKER)
+    assert "    y = magic(str, int)\n" + checked("y", "str, int", "identifier") + "    return y\n" in checker
+    concrete = compiled([model_identifier], Compilation.CONCRETE)
     assert (
-        real_call_block("y", "test_effecful.identifier(name)", "identifier")
+        real_call_block("y", "_real_identifier(name)", "identifier")
         + "    assert isinstance(y, (str, int))\n    return y\n"
     ) in concrete
 
@@ -1101,7 +1233,7 @@ def test_concrete_compile_needs_typed_magic_in_a_variable():
         return x
 
     with pytest.raises(UncompilableModel, match=r"uses magic\(int\) \(line \d+\) inside an expression"):
-        compile_models([model_inc_typed_expression], Compilation.CONCRETE)
+        compiled([model_inc_typed_expression], Compilation.CONCRETE)
 
 
 def test_compile_needs_its_iterator_names_free():
@@ -1111,7 +1243,7 @@ def test_compile_needs_its_iterator_names_free():
         return _result
 
     with pytest.raises(UncompilableModel, match=r"uses \['_result'\], which the compiled code needs"):
-        compile_models([model_roll_into_result], Compilation.CONCRETE)
+        compiled([model_roll_into_result], Compilation.CONCRETE)
 
 
 def test_compile_rejects_what_it_cannot_write_out():
@@ -1133,28 +1265,28 @@ def test_compile_rejects_what_it_cannot_write_out():
         constraint(True)
 
     with pytest.raises(UncompilableModel, match=r"uses \['limit'\] from the function around it"):
-        compile_models([model_take_limited], Compilation.MODEL_CHECKER)
+        compiled([model_take_limited], Compilation.MODEL_CHECKER)
     with pytest.raises(UncompilableModel, match=r"inside an expression; write constraint\(\) as its own statement"):
-        compile_models([model_take_constraint_in_expression], Compilation.MODEL_CHECKER)
+        compiled([model_take_constraint_in_expression], Compilation.MODEL_CHECKER)
     with pytest.raises(UncompilableModel, match="has no return to match against the result of the real count"):
-        compile_models([model_count_without_return], Compilation.CONCRETE)
-    with pytest.raises(UncompilableModel, match="compiling class models isn't supported yet"):
-        compile_models([_model_Dog], Compilation.MODEL_CHECKER)
+        compiled([model_count_without_return], Compilation.CONCRETE)
+    with pytest.raises(UncompilableModel, match="compile class models for a model checker"):
+        compiled([_model_Dog], Compilation.CONCRETE)
     with pytest.raises(UncompilableModel, match="plain patches"):
-        compile_models([simple], Compilation.MODEL_CHECKER)
-    with pytest.raises(UncompilableModel, match="both compile to a function named pair"):
-        compile_models([_model_pair, model_pair_alone], Compilation.MODEL_CHECKER)
+        compiled([simple], Compilation.MODEL_CHECKER)
+    with pytest.raises(UncompilableModel, match="both compile to pair in test_effecful"):
+        compiled([_model_pair, model_pair_alone], Compilation.MODEL_CHECKER)
 
 
 def test_concrete_compile_checks_a_reassigned_magic_variable():
     namespace = {}
-    exec(compile_models([model_number_reassigned], Compilation.CONCRETE), namespace)
+    exec(compiled([model_number_reassigned], Compilation.CONCRETE), namespace)
     with pytest.raises(AssertionError):
         namespace["number"]()
 
 
 def test_concrete_compile_of_one_magic_in_a_branch():
-    concrete = compile_models([model_number_in_branch], Compilation.CONCRETE)
+    concrete = compiled([model_number_in_branch], Compilation.CONCRETE)
     assert "    _magic = iter((_result,))\n" in concrete
     namespace = {}
     exec(concrete, namespace)
@@ -1163,7 +1295,7 @@ def test_concrete_compile_of_one_magic_in_a_branch():
 
 def test_concrete_compile_reports_a_result_that_does_not_unpack():
     namespace = {}
-    exec(compile_models([model_triple_as_pair], Compilation.CONCRETE), namespace)
+    exec(compiled([model_triple_as_pair], Compilation.CONCRETE), namespace)
     with pytest.raises(
         AssertionError, match=r"the real triple returned \(1, 2, 3\), which doesn't unpack into its model's magic values \(q, r\)"
     ):
@@ -1172,27 +1304,27 @@ def test_concrete_compile_reports_a_result_that_does_not_unpack():
 
 def test_concrete_compile_checks_falling_off_the_end():
     namespace = {}
-    exec(compile_models([model_negative_falling_off], Compilation.CONCRETE), namespace)
+    exec(compiled([model_negative_falling_off], Compilation.CONCRETE), namespace)
     with pytest.raises(AssertionError, match="the real negative returned -1, but its model returns None for it"):
         namespace["negative"]()
 
 
 def test_concrete_compile_reports_drawing_more_than_the_real_result_has():
     namespace = {}
-    exec(compile_models([model_two_drawing_three], Compilation.CONCRETE), namespace)
+    exec(compiled([model_two_drawing_three], Compilation.CONCRETE), namespace)
     with pytest.raises(AssertionError, match=r"drew more values than the real two returned in \[1, 2\]"):
         namespace["two"]()
 
 
 def test_concrete_compile_reports_a_result_without_elements():
     namespace = {}
-    exec(compile_models([model_number_drawing_twice], Compilation.CONCRETE), namespace)
+    exec(compiled([model_number_drawing_twice], Compilation.CONCRETE), namespace)
     with pytest.raises(AssertionError, match=r"the real number returned 5, which has no elements"):
         namespace["number"]()
 
 
 def test_concrete_compile_lets_exceptions_through_when_a_raise_is_unreadable():
-    concrete = compile_models([model_fetch_missing], Compilation.CONCRETE)
+    concrete = compiled([model_fetch_missing], Compilation.CONCRETE)
     assert "try:" not in concrete
     namespace = {}
     exec(concrete, namespace)
@@ -1201,18 +1333,19 @@ def test_concrete_compile_lets_exceptions_through_when_a_raise_is_unreadable():
 
 
 def test_compile_recognizes_magic_and_constraint_through_the_module():
-    checker = compile_models([model_number_qualified], Compilation.MODEL_CHECKER)
-    assert "def number():\n    x = magic(int)\n    assert isinstance(x, int)\n    assert x > 0\n    return x\n" in checker
+    checker = compiled([model_number_qualified], Compilation.MODEL_CHECKER)
+    assert "def number():\n    x = magic(int)\n" + checked("x", "int", "number") + holds("x > 0", "number") + \
+        "    return x\n" in checker
     assert "import" not in checker
     namespace = {}
-    exec(compile_models([model_number_qualified], Compilation.CONCRETE), namespace)
+    exec(compiled([model_number_qualified], Compilation.CONCRETE), namespace)
     assert namespace["number"]() == 5
     by_name = {THIS_MODULE: {number: lambda: {"x": [7]}}}
     assert run_model([model_number_qualified], by_name)(lambda: number()) == 7
 
 
 def test_compile_imports_names_used_in_defaults_and_annotations():
-    concrete = compile_models([model_write], Compilation.CONCRETE)
+    concrete = compiled([model_write], Compilation.CONCRETE)
     assert "from test_effecful import DEFAULT_MODE\n" in concrete
     assert "from test_effecful import Path\n" in concrete
     namespace = {}
@@ -1224,8 +1357,8 @@ def test_concrete_compile_needs_the_original_defaults():
     with pytest.raises(
         UncompilableModel, match=r"model_write_other_default gives mode the default 'w', but the real write gives mode the default 'r'"
     ):
-        compile_models([model_write_other_default], Compilation.CONCRETE)
-    assert "def write(path, mode='w'):" in compile_models([model_write_other_default], Compilation.MODEL_CHECKER)
+        compiled([model_write_other_default], Compilation.CONCRETE)
+    assert "def write(path, mode='w'):" in compiled([model_write_other_default], Compilation.MODEL_CHECKER)
 
 
 if __name__ == "__main__":

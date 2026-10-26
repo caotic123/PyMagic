@@ -703,3 +703,71 @@ def test_requests_run_none_of_the_libraries_modelled(routes, request_):
     assert {module for module in run if module.startswith(NOT_RUN) and
             any(module == name or module.startswith(name + ".") for name in NOT_RUN)} == set()
     assert "http_model" in run or "builtins" in run
+
+
+# ------------------------------------------------------------------ compiled for a model checker
+
+from MagicF import Compilation, compile_models
+from MagicF.compile import write_package
+
+RUN_COMPILED = """\
+import sys, json, builtins, importlib.abc
+
+class Refuse(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] in ("httplib2", "MagicF", "http_model", "stdlib_model", "pyparsing"):
+            raise ImportError(name + " isn't available to the compiled model")
+sys.meta_path.insert(0, Refuse())
+
+values = []
+builtins.magic = lambda *kinds: values.pop(0)
+import compiled, gzip, socket
+import httplib2
+
+def run(draws, call):
+    values[:] = [None] * 8 + draws  # Http() reads its four decode limits from the environment, two variables each
+    try:
+        return repr(call())
+    except BaseException as error:
+        return type(error).__name__ + ": " + str(error)
+
+json_reply = [None, 200, "OK", 11, {"Content-Type": "application/json"}, b'{"name": "lol"}']
+for draws, call in [
+    (json_reply, lambda: httplib2.Http().request("http://api.test/user")[1]),
+    ([None, 302, "Found", 11, {"Location": "/user"}, b""] + json_reply,
+     lambda: (lambda response: (response.status, response.previous.status))(httplib2.Http().request("http://api.test/old")[0])),
+    ([socket.gaierror(-2, "Name or service not known")], lambda: httplib2.Http().request("http://api.test/")),
+    ([None, 42, "?", 11, {}, b""], lambda: httplib2.Http().request("http://api.test/")),
+    ([], lambda: httplib2.Http().request("/relative")),
+    ([None, 200, "OK", 11, {"Content-Encoding": "gzip"}, gzip.compress(b"squeezed")],
+     lambda: httplib2.Http().request("http://api.test/z")[1]),
+]:
+    print(run(draws, call))
+print([name for name in ("MagicF", "http_model", "stdlib_model", "pyparsing") if name in sys.modules])
+"""
+
+def test_whole_model_compiles_to_a_package_that_names_no_model_or_library():
+    files = compile_models(models, Compilation.MODEL_CHECKER)
+    assert {"__init__.py", "httplib2/__init__.py", "httplib2/error.py", "httplib2/decode.py", "httplib2/iri2uri.py",
+            "_hashlib.py", "binascii.py", "zlib.py", "time.py", "random.py", "re.py", "socket.py", "unicodedata.py",
+            "http/client.py", "encodings/idna.py"} <= set(files)
+    for path, source in files.items():
+        tree = ast.parse(source)
+        imported = {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level == 0}
+        assert imported & {"MagicF", "httplib2", "http_model", "stdlib_model", "pyparsing"} == set(), path
+
+def test_whole_model_runs_compiled_without_httplib2_or_magicf(tmp_path):
+    import subprocess
+    write_package(compile_models(models, Compilation.MODEL_CHECKER), tmp_path / "compiled")
+    run = subprocess.run([sys.executable, "-c", RUN_COMPILED], cwd=tmp_path, capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines() == [
+        "b'{\"name\": \"lol\"}'",
+        "(200, 302)",
+        "ServerNotFoundError: Unable to find the server at api.test",
+        "AssertionError: the values broke 101 <= status <= 999: the model of request rejected this call",
+        "RelativeURIError: Only absolute URIs are allowed. uri = /relative",
+        "b'squeezed'",
+        "[]",
+    ]
