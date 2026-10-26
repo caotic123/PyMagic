@@ -25,7 +25,7 @@ See that by replacing magic with its proper side effect, we can effectively run 
 Also, the code is runnable and should match the semantics if you try to run it by selecting valid values or using a symbolic engine; of course, you need to introduce semantics for magic. Given that a Python object is non-empty, one model is given a Python object x; we select one x such that the constraints that meet x are true. Running by selecting valid values is already given by the library. The decorator allows mocking values, and when testing using concrete values the constraints become assertions. This allows you to test if your model respects your specs.
 
 *LLM disclaimer: This library was written partially with the help of LLMs, mostly the compilation part; the code was reviewed, although*
-
+*Pr are very welcome, however not pure LLM-based. The code still has to be complete or at least partially understood by a human*
 # LLM iteration
 
 Just simply asking the LLM to find bugs using models/compiled models is enough to find bugs that would be hidden if no model is designed. Models allow them to reason about specs (Although vibe-coding models without review is not preferred over reviewed human models). The first step is just starting to refine a model. Mocking real values that mimic the effectful/magic computation is the second phase. In fact, this substantially increases the debugging surface, since it make clear to the LLM iteration that a proper spec should be written and respect. 
