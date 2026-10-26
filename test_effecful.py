@@ -1361,5 +1361,45 @@ def test_concrete_compile_needs_the_original_defaults():
     assert "def write(path, mode='w'):" in compiled([model_write_other_default], Compilation.MODEL_CHECKER)
 
 
+
+# ------------------------------------------------------------------ the command line
+
+from MagicF.cli import main as command_line, models_named
+
+
+def test_command_line_names_models_by_module_and_attribute():
+    assert models_named("effecful") == models
+    assert models_named("effecful:_model_Random") == [_model_Random]
+    assert models_named("test_effecful:_model_module_with_Box._model_Box_inside") == [_model_module_with_Box._model_Box_inside]
+
+
+def test_command_line_prints_the_package(capsys):
+    assert command_line(["compile", "effecful"]) == 0
+    printed = capsys.readouterr().out
+    for path, source in compile_models(models, Compilation.MODEL_CHECKER).items():
+        assert f" {path}\n{source}" in printed
+
+
+def test_command_line_writes_the_package(tmp_path, capsys):
+    output = tmp_path / "compiled"
+    assert command_line(["compile", "effecful", "--concrete", "-o", str(output)]) == 0
+    files = compile_models(models, Compilation.CONCRETE)
+    assert {str(path.relative_to(output)): path.read_text() for path in output.rglob("*.py")} == files
+    assert capsys.readouterr().out == f"wrote {len(files)} files to {output}\n"
+    # a directory that isn't empty is written into only with --force
+    assert command_line(["compile", "effecful", "-o", str(output)]) == 1
+    assert "isn't empty; use --force" in capsys.readouterr().err
+    assert command_line(["compile", "effecful", "-o", str(output), "--force"]) == 0
+    assert (output / "random.py").read_text() == compile_models(models, Compilation.MODEL_CHECKER)["random.py"]
+
+
+def test_command_line_reports_what_it_cannot_compile(capsys):
+    assert command_line(["compile", "test_effecful:_model_Dog", "--concrete"]) == 1
+    assert capsys.readouterr().err.startswith("MagicF: _model_Dog models the class Dog")
+    with pytest.raises(SystemExit) as exit:
+        command_line(["compile", "nowhere:models"])
+    assert exit.value.code == 2
+    assert "no models at nowhere:models" in capsys.readouterr().err
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
