@@ -5,7 +5,7 @@
 
 import http.client
 
-from MagicF import model
+from PyMagic import model
 
 HTTP_PORT = 80
 HTTPS_PORT = 443

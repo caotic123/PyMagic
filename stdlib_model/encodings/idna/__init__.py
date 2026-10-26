@@ -9,7 +9,7 @@ import encodings.idna
 import encodings.punycode  # loaded now rather than by the codec registry in a run
 from encodings.idna import nameprep  # modelled: in a run, its model
 
-from MagicF import constraint, magic, model
+from PyMagic import constraint, magic, model
 
 # IDNA section 3.1
 DOTS = ".。．｡"

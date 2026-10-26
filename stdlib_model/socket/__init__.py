@@ -3,7 +3,7 @@
 
 import socket
 
-from MagicF import model
+from PyMagic import model
 
 
 @model(socket.gaierror)

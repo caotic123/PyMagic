@@ -2,7 +2,7 @@ import unicodedata
 
 import pytest
 
-from MagicF import BrokenVariant, run_model
+from PyMagic import BrokenVariant, run_model
 from stdlib_model import models
 from stdlib_model.testing import modelled, outcome
 

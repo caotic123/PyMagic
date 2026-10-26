@@ -3,7 +3,7 @@
 
 import httplib2.error
 
-from MagicF import model
+from PyMagic import model
 
 
 @model(httplib2.error.HttpLib2Error)

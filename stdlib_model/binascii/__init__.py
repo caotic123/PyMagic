@@ -3,7 +3,7 @@
 
 import binascii
 
-from MagicF import model
+from PyMagic import model
 
 BASE64_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 

@@ -6,7 +6,7 @@
 
 import zlib
 
-from MagicF import RunningUnstatedModel, model
+from PyMagic import RunningUnstatedModel, model
 
 MAX_WBITS = 15
 DEF_BUF_SIZE = 16384

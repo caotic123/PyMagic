@@ -3,7 +3,7 @@ import random
 
 import pytest
 
-from MagicF import BrokenVariant, RunningUnstatedModel
+from PyMagic import BrokenVariant, RunningUnstatedModel
 from stdlib_model.magics import stdlib_magics
 from stdlib_model.testing import NOW, each, modelled, modelled_each, outcome
 from stdlib_model.time import is_ctime

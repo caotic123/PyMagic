@@ -1,6 +1,6 @@
 # what the tests of the standard library models share: running calls on the models, and their outcomes
 
-from MagicF import Model, run_model
+from PyMagic import Model, run_model
 
 from . import models
 from .magics import stdlib_magics
@@ -35,7 +35,7 @@ def each(calls):
 import ast
 import importlib
 
-from MagicF import get_models
+from PyMagic import get_models
 
 # the modules the standard library models model, which the models reach only through them
 MODELLED_MODULES = {"binascii", "hashlib", "_hashlib", "zlib", "time", "random", "unicodedata", "encodings", "http",
@@ -84,7 +84,7 @@ def resolved(dotted):
 
 def modelled_originals(all_models):
     # what the models stand in for: the functions and classes they model
-    from MagicF.model import model_members
+    from PyMagic.model import model_members
     originals = set()
     for kind, entry in get_models(all_models):
         if kind is Model.COPY:

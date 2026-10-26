@@ -2,7 +2,7 @@ import encodings.idna
 
 import pytest
 
-from MagicF import BrokenVariant
+from PyMagic import BrokenVariant
 from stdlib_model.encodings import idna
 from stdlib_model.testing import modelled, outcome
 

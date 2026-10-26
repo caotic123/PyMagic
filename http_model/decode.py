@@ -6,7 +6,7 @@ from typing import Protocol
 
 import httplib2.decode
 
-from MagicF import constraint, magic, model
+from PyMagic import constraint, magic, model
 
 
 # ------------------------------------------------------------------ copied from httplib2

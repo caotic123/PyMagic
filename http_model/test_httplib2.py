@@ -19,8 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httplib2
 import pytest
 
-from MagicF import BrokenVariant, Model, RunningUnstatedModel, get_models, run_model
-from MagicF.model import model_members
+from PyMagic import BrokenVariant, Model, RunningUnstatedModel, get_models, run_model
+from PyMagic.model import model_members
 import httplib2.auth
 from http_model import _model_httplib2, auth, models
 from http_model.decode import ZlibDecoder, raw_deflate
@@ -653,7 +653,7 @@ NOT_RUN = ("httplib2", "pyparsing", "hashlib", "_hashlib", "hmac", "zlib", "bina
            "_socket", "ssl", "_ssl", "http.client", "email", "errno")
 
 def from_a_model(frame):
-    # whether the nearest frame of this project's code is a model's, rather than MagicF's, a test's or the magics'
+    # whether the nearest frame of this project's code is a model's, rather than PyMagic's, a test's or the magics'
     while frame is not None:
         path = pathlib.Path(frame.f_code.co_filename)
         if PROJECT in path.parents:
@@ -707,15 +707,15 @@ def test_requests_run_none_of_the_libraries_modelled(routes, request_):
 
 # ------------------------------------------------------------------ compiled for a model checker
 
-from MagicF import Compilation, compile_models
-from MagicF.compile import write_package
+from PyMagic import Compilation, compile_models
+from PyMagic.compile import write_package
 
 RUN_COMPILED = """\
 import sys, json, builtins, importlib.abc
 
 class Refuse(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path=None, target=None):
-        if name.split(".")[0] in ("httplib2", "MagicF", "http_model", "stdlib_model", "pyparsing"):
+        if name.split(".")[0] in ("httplib2", "PyMagic", "http_model", "stdlib_model", "pyparsing"):
             raise ImportError(name + " isn't available to the compiled model")
 sys.meta_path.insert(0, Refuse())
 
@@ -743,7 +743,7 @@ for draws, call in [
      lambda: httplib2.Http().request("http://api.test/z")[1]),
 ]:
     print(run(draws, call))
-print([name for name in ("MagicF", "http_model", "stdlib_model", "pyparsing") if name in sys.modules])
+print([name for name in ("PyMagic", "http_model", "stdlib_model", "pyparsing") if name in sys.modules])
 """
 
 def test_whole_model_compiles_to_a_package_that_names_no_model_or_library():
@@ -755,9 +755,9 @@ def test_whole_model_compiles_to_a_package_that_names_no_model_or_library():
         tree = ast.parse(source)
         imported = {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
         imported |= {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level == 0}
-        assert imported & {"MagicF", "httplib2", "http_model", "stdlib_model", "pyparsing"} == set(), path
+        assert imported & {"PyMagic", "httplib2", "http_model", "stdlib_model", "pyparsing"} == set(), path
 
-def test_whole_model_runs_compiled_without_httplib2_or_magicf(tmp_path):
+def test_whole_model_runs_compiled_without_httplib2_or_pymagic(tmp_path):
     import subprocess
     write_package(compile_models(models, Compilation.MODEL_CHECKER), tmp_path / "compiled")
     run = subprocess.run([sys.executable, "-c", RUN_COMPILED], cwd=tmp_path, capture_output=True, text=True)

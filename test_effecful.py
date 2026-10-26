@@ -7,9 +7,9 @@ from unittest import mock
 
 import pytest
 
-import MagicF
-from MagicF.compile import PACKAGE_INIT, write_package
-from MagicF import (
+import PyMagic
+from PyMagic.compile import PACKAGE_INIT, write_package
+from PyMagic import (
     BrokenVariant, MissedModelObject, RunningUnstatedModel, UncompilableModel,
     Compilation, Model, collect_magic, compile_models, constraint, get_models, magic, model, run_model,
 )
@@ -276,8 +276,8 @@ def model_number_drawing_twice():
 
 @model(number)
 def model_number_qualified():
-    x = MagicF.magic(int)
-    MagicF.constraint(x > 0)
+    x = PyMagic.magic(int)
+    PyMagic.constraint(x > 0)
     return x
 
 
@@ -867,7 +867,7 @@ def run_compiled(models, compilation, namespace, files=None):
 
 
 CHECKER_HEADER = (
-    "# compiled from MagicF models for a model checker, which supplies magic()\n"
+    "# compiled from PyMagic models for a model checker, which supplies magic()\n"
     "# magic() values breaking a constraint fail its assert with a BrokenVariant\n"
 )
 
@@ -881,7 +881,7 @@ CHECKER_SOURCES = {
 
 CONCRETE_SOURCES = {
     "random.py": """\
-# compiled from MagicF models, with the real effects in place of magic()
+# compiled from PyMagic models, with the real effects in place of magic()
 import random
 
 
@@ -898,7 +898,7 @@ def randint(min, max):
     return x
 """,
     "builtins.py": """\
-# compiled from MagicF models, with the real effects in place of magic()
+# compiled from PyMagic models, with the real effects in place of magic()
 import builtins
 
 
@@ -991,7 +991,7 @@ def test_model_raising_broken_variant_itself_gets_the_compiled_one():
 
 def test_model_using_another_broken_variant_is_not_compiled(tmp_path, monkeypatch):
     (tmp_path / "own_broken_variant.py").write_text(
-        "from MagicF import magic, model\n\n"
+        "from PyMagic import magic, model\n\n"
         "class BrokenVariant(Exception):\n    pass\n\n"
         "def judged(value):\n    return value\n\n"
         "@model(judged)\n"
@@ -1364,7 +1364,7 @@ def test_concrete_compile_needs_the_original_defaults():
 
 # ------------------------------------------------------------------ the command line
 
-from MagicF.cli import main as command_line, models_named
+from PyMagic.cli import main as command_line, models_named
 
 
 def test_command_line_names_models_by_module_and_attribute():
@@ -1395,7 +1395,7 @@ def test_command_line_writes_the_package(tmp_path, capsys):
 
 def test_command_line_reports_what_it_cannot_compile(capsys):
     assert command_line(["compile", "test_effecful:_model_Dog", "--concrete"]) == 1
-    assert capsys.readouterr().err.startswith("MagicF: _model_Dog models the class Dog")
+    assert capsys.readouterr().err.startswith("PyMagic: _model_Dog models the class Dog")
     with pytest.raises(SystemExit) as exit:
         command_line(["compile", "nowhere:models"])
     assert exit.value.code == 2

@@ -158,7 +158,7 @@ def as_copy(value):
     return transplanted(value, copy)
 
 LOADS = {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_DEREF", "LOAD_FAST"}
-ATTRIBUTE_LOADS = {"LOAD_METHOD", "LOAD_ATTR"}  # MagicF.magic
+ATTRIBUTE_LOADS = {"LOAD_METHOD", "LOAD_ATTR"}  # PyMagic.magic
 CALLS = {"CALL_FUNCTION", "CALL_METHOD", "CALL"}
 STORES = {"STORE_FAST", "STORE_NAME", "STORE_GLOBAL", "STORE_DEREF"}
 SKIPPED = {"CACHE", "PUSH_NULL", "PRECALL"}  # no-ops around calls in Python 3.11+

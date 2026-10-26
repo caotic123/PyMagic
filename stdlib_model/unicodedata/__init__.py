@@ -4,7 +4,7 @@
 
 import unicodedata
 
-from MagicF import constraint, magic, model
+from PyMagic import constraint, magic, model
 
 FORMS = ("NFC", "NFKC", "NFD", "NFKD")
 

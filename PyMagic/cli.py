@@ -1,4 +1,4 @@
-# the command line: python -m MagicF compile MODELS [-o DIRECTORY] [--concrete] [--force]
+# the command line: python -m PyMagic compile MODELS [-o DIRECTORY] [--concrete] [--force]
 
 import sys
 import argparse
@@ -19,7 +19,7 @@ def models_named(reference):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="python -m MagicF", description="MagicF: models of effectful functions")
+    parser = argparse.ArgumentParser(prog="python -m PyMagic", description="PyMagic: models of effectful functions")
     commands = parser.add_subparsers(dest="command", required=True)
     compiling = commands.add_parser(
         "compile", help="compile models to a package of Python modules",
@@ -44,7 +44,7 @@ def main(argv=None):
     try:
         files = compile_models(models, compilation)
     except UncompilableModel as error:
-        print(f"MagicF: {error}", file=sys.stderr)
+        print(f"PyMagic: {error}", file=sys.stderr)
         return 1
 
     if arguments.output is None:
@@ -53,7 +53,7 @@ def main(argv=None):
         return 0
     output = pathlib.Path(arguments.output)
     if output.exists() and any(output.iterdir()) and not arguments.force:
-        print(f"MagicF: {output} isn't empty; use --force to write into it", file=sys.stderr)
+        print(f"PyMagic: {output} isn't empty; use --force to write into it", file=sys.stderr)
         return 1
     write_package(files, output)
     print(f"wrote {len(files)} files to {output}")

@@ -6,7 +6,7 @@
 import time
 from operator import index as _index
 
-from MagicF import RunningUnstatedModel, constraint, magic, model
+from PyMagic import RunningUnstatedModel, constraint, magic, model
 
 from ..errno import EOVERFLOW
 

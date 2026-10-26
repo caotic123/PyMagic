@@ -26,9 +26,9 @@ class Compilation(Enum):
     CONCRETE = auto()       # magic() takes its values from the real effect the model stands in for
 
 COMPILED_HEADERS = {
-    Compilation.MODEL_CHECKER: "# compiled from MagicF models for a model checker, which supplies magic()\n"
+    Compilation.MODEL_CHECKER: "# compiled from PyMagic models for a model checker, which supplies magic()\n"
                                "# magic() values breaking a constraint fail its assert with a BrokenVariant",
-    Compilation.CONCRETE: "# compiled from MagicF models, with the real effects in place of magic()",
+    Compilation.CONCRETE: "# compiled from PyMagic models, with the real effects in place of magic()",
 }
 
 # names the concrete code gives the real result, the iterator of its magic values, the real exception and
@@ -374,7 +374,7 @@ class ModelCompiler(ast.NodeTransformer):
         return broken_variant(*parts, f": the model of {self.name} rejected this call")
 
     def calls(self, node, target):
-        # a call of target by its name, an alias of it, or through its module (MagicF.magic)
+        # a call of target by its name, an alias of it, or through its module (PyMagic.magic)
         if not isinstance(node, ast.Call):
             return False
         if isinstance(node.func, ast.Name) and node.func.id == target.__name__:
@@ -564,7 +564,7 @@ def compile_concrete(func, original, node):
 
 # written as the compiled package's __init__.py
 INSTALLER = '''\
-# installs the compiled models in place of their originals, as MagicF's run_model does during a run, but for
+# installs the compiled models in place of their originals, as PyMagic's run_model does during a run, but for
 # good: each original the standard library holds is replaced wherever a loaded module holds it, and each other
 # module the models stand in for is the compiled one
 import sys
@@ -593,7 +593,7 @@ def install():
 install()
 '''
 
-PACKAGE_INIT = "# compiled from MagicF models: a package of compiled modules\n"
+PACKAGE_INIT = "# compiled from PyMagic models: a package of compiled modules\n"
 
 class Span:
     # a stretch of source, positioned as the nodes of a syntax tree are: lines from 1, columns in UTF-8 bytes
@@ -723,7 +723,7 @@ def relative_name(home, target, packages):
     return "." * (2 + package.count(".") if package else 1) + target
 
 def model_decorators(tree, namespace):
-    # the decorators of a definition that are MagicF's model(): (the definition, the decorators)
+    # the decorators of a definition that are PyMagic's model(): (the definition, the decorators)
     definition = tree.body[0]
     return [decorator for decorator in getattr(definition, "decorator_list", [])
             if isinstance(decorator, ast.Call) and resolved_in(namespace, decorator.func) is model]
@@ -903,7 +903,7 @@ class Package:
         parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         skipped = {id(node) for drop in dropped for node in ast.walk(drop)}
         replacements = {}
-        # the flags the compiler writes name MagicF's BrokenVariant, wherever the model is
+        # the flags the compiler writes name PyMagic's BrokenVariant, wherever the model is
         given = {"BrokenVariant": BrokenVariant} if self.checker else {}
         for name_node in global_references(tree):
             if id(name_node) in skipped:
@@ -941,7 +941,7 @@ class Package:
             return "BrokenVariant"
         if preferred == "BrokenVariant" and self.checker:
             raise UncompilableModel(
-                f"{user} uses a BrokenVariant of its own, but the compiled module defines BrokenVariant as MagicF's; "
+                f"{user} uses a BrokenVariant of its own, but the compiled module defines BrokenVariant as PyMagic's; "
                 f"rename it"
             )
         if id(value) in self.placed:

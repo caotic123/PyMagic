@@ -4,7 +4,7 @@
 import importlib
 import urllib.parse
 
-from MagicF import constraint, magic, model
+from PyMagic import constraint, magic, model
 from stdlib_model.encodings import idna
 
 IRI2URI = importlib.import_module("httplib2.iri2uri")  # httplib2.iri2uri is the function, hiding the module

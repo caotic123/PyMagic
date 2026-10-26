@@ -22,7 +22,7 @@ from types import NoneType
 import httplib2
 from httplib2 import proxy_info_from_environment, proxy_info_from_url, try_value_or_env  # models, in a run
 
-from MagicF import RunningUnstatedModel, constraint, magic, model
+from PyMagic import RunningUnstatedModel, constraint, magic, model
 from stdlib_model import models as stdlib_models
 from stdlib_model import re
 from stdlib_model.email.message import Message

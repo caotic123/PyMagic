@@ -1,10 +1,10 @@
-# example models of random.randint and input, run with MagicF
+# example models of random.randint and input, run with PyMagic
 
 import random
 import builtins
 import itertools
 
-from MagicF import model, magic, constraint
+from PyMagic import model, magic, constraint
 
 
 @model(random)

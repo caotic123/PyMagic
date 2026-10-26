@@ -4,7 +4,7 @@
 
 import re
 
-from MagicF import model
+from PyMagic import model
 
 MAXGROUPS = 2147483647  # sre_constants.MAXGROUPS
 

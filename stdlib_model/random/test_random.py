@@ -2,7 +2,7 @@ import random
 
 import pytest
 
-from MagicF import BrokenVariant
+from PyMagic import BrokenVariant
 from stdlib_model.magics import stdlib_magics
 from stdlib_model.testing import modelled, outcome
 

@@ -31,11 +31,11 @@ Just simply asking the LLM to find bugs using models/compiled models is enough t
 
 # How to use
 
-MagicF needs Python 3.10 or later. The httplib2 model also needs `httplib2`, and the tests need `pytest`:
+PyMagic needs Python 3.10 or later. The httplib2 model also needs `httplib2`, and the tests need `pytest`:
 
 ```bash
 pip install httplib2 pytest
-python3.10 -m pytest          # the tests of MagicF and of the models
+python3.10 -m pytest          # the tests of PyMagic and of the models
 ```
 
 ## Model an effect: a dice game
@@ -48,7 +48,7 @@ die can show:
 import random
 from collections import Counter
 
-from MagicF import BrokenVariant, constraint, magic, model, run_model
+from PyMagic import BrokenVariant, constraint, magic, model, run_model
 
 
 def play():
@@ -127,7 +127,7 @@ import socket
 
 import httplib2
 
-from MagicF import run_model
+from PyMagic import run_model
 from http_model import models
 from http_model.magics import module_magics, reply
 from stdlib_model.magics import stdlib_magics
@@ -173,7 +173,7 @@ the checker to supply, and constraints become asserts that fail with a `BrokenVa
 as `dice.py`:
 
 ```bash
-python3.10 -m MagicF compile dice:randint -o out/compiled
+python3.10 -m PyMagic compile dice:randint -o out/compiled
 ```
 
 That writes `out/compiled/random.py`:
@@ -207,10 +207,10 @@ play()    # 'doubles: you win a pizza'
 play()    # AssertionError: the values broke a <= face <= b: ... (its message is a BrokenVariant)
 ```
 
-The whole httplib2 model compiles the same way, into 17 modules that need neither httplib2 nor MagicF:
+The whole httplib2 model compiles the same way, into 17 modules that need neither httplib2 nor PyMagic:
 
 ```bash
-python3.10 -m MagicF compile http_model -o out/compiled
+python3.10 -m PyMagic compile http_model -o out/compiled
 ```
 
 From Python, `compile_models(models, Compilation.MODEL_CHECKER)` returns the package as `{path: source}`, and
@@ -219,7 +219,7 @@ From Python, `compile_models(models, Compilation.MODEL_CHECKER)` returns the pac
 # Command line
 
 ```
-python3.10 -m MagicF compile MODELS [-o DIRECTORY] [--concrete] [--force]
+python3.10 -m PyMagic compile MODELS [-o DIRECTORY] [--concrete] [--force]
 ```
 
 - `MODELS` is `module:attribute`, naming a model or a list of them, like `dice:randint` or
@@ -229,11 +229,11 @@ python3.10 -m MagicF compile MODELS [-o DIRECTORY] [--concrete] [--force]
 - `--concrete` compiles the models to call the real effects in place of `magic()`, checking each result against
   the model, instead of compiling them for a model checker.
 - If the models can't be compiled, the reason is printed and the exit code is 1. If they can't be found, the exit
-  code is 2. `python3.10 -m MagicF compile --help` shows this too.
+  code is 2. `python3.10 -m PyMagic compile --help` shows this too.
 
 # What's here
 
-- `MagicF/`: the library. `model.py` has `@model`, `magic()` and `constraint()`; `run.py` has `run_model`;
+- `PyMagic/`: the library. `model.py` has `@model`, `magic()` and `constraint()`; `run.py` has `run_model`;
   `compile.py` has `compile_models`; `cli.py` has the command line.
 - `http_model/`: a model of httplib2, laid out as httplib2 is.
 - `stdlib_model/`: models of the standard library modules the httplib2 model reaches, a folder for each.

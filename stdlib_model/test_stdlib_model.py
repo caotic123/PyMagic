@@ -5,7 +5,7 @@ from types import NoneType
 
 import pytest
 
-from MagicF import Model, get_models
+from PyMagic import Model, get_models
 from stdlib_model import errno as model_errno, models
 from stdlib_model.testing import improper_uses
 

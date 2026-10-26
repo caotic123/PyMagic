@@ -6,7 +6,7 @@ import random
 from operator import index as _index
 from warnings import warn as _warn
 
-from MagicF import constraint, magic, model
+from PyMagic import constraint, magic, model
 
 _ONE = 1
 

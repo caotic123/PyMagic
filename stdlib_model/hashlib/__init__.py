@@ -5,7 +5,7 @@
 import _hashlib
 import hashlib
 
-from MagicF import model
+from PyMagic import model
 
 MASK = 0xFFFFFFFF
 

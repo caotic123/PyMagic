@@ -4,7 +4,7 @@ import random
 
 import pytest
 
-from MagicF import RunningUnstatedModel
+from PyMagic import RunningUnstatedModel
 from stdlib_model.testing import modelled, outcome
 
 
