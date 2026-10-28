@@ -11,7 +11,7 @@ import PyMagic
 from PyMagic.compile import PACKAGE_INIT, write_package
 from PyMagic import (
     BrokenVariant, MissedModelObject, RunningUnstatedModel, UncompilableModel,
-    Compilation, Model, collect_magic, compile_models, constraint, get_models, magic, model, run_model,
+    Compilation, Model, collect_magic, compile_models, constraint, get_models, magic, model, named, run_model,
 )
 from effecful import magics, magics_by_name, models, simple, _model_Random
 
@@ -849,9 +849,10 @@ class BrokenVariant(BaseException):
 """
 
 def compiled(models, compilation, module=None):
-    # the source of the module the models compile to, or of the one standing in for module
+    # the source of the module the models compile to, or of the one standing in for module; the installer and
+    # _pymagic.py, with what models use of PyMagic, aren't theirs
     files = {path: source for path, source in compile_models(models, compilation).items()
-             if path != "__init__.py" and source != PACKAGE_INIT}
+             if path not in ("__init__.py", "_pymagic.py") and source != PACKAGE_INIT}
     if module is None:
         (source,) = files.values()
         return source
@@ -859,11 +860,17 @@ def compiled(models, compilation, module=None):
 
 
 def run_compiled(models, compilation, namespace, files=None):
-    # each module the models compile to, run in one namespace
-    for path, source in (files or compile_models(models, compilation)).items():
+    # each module the models compile to, run in one namespace: _pymagic.py first, and without their imports from
+    # one another, as their names are all in it
+    for path, source in sorted((files or compile_models(models, compilation)).items()):
         if path != "__init__.py":
-            exec(source, namespace)
+            exec("\n".join(line for line in source.splitlines() if not line.startswith("from .")), namespace)
     return namespace
+
+
+def absolute_imports(source):
+    # the imports of a compiled module from outside its package
+    return [line for line in source.splitlines() if line.startswith(("import ", "from ")) and not line.startswith("from .")]
 
 
 CHECKER_HEADER = (
@@ -872,10 +879,11 @@ CHECKER_HEADER = (
 )
 
 CHECKER_SOURCES = {
-    "random.py": CHECKER_HEADER + "\n\n" + BROKEN_VARIANT_CLASS + "\n\n"
+    "_pymagic.py": CHECKER_HEADER + "\n\n" + BROKEN_VARIANT_CLASS,
+    "random.py": CHECKER_HEADER + "from ._pymagic import BrokenVariant\n\n\n"
     "def randint(min, max):\n    x = magic(int)\n" + checked("x", "int", "randint") + holds("min <= x <= max", "randint")
     + "    return x\n",
-    "builtins.py": CHECKER_HEADER + "\n\n" + BROKEN_VARIANT_CLASS + "\n\n"
+    "builtins.py": CHECKER_HEADER + "from ._pymagic import BrokenVariant\n\n\n"
     "def input(prompt=''):\n    x = magic(str)\n" + checked("x", "str", "input") + "    return x\n",
 }
 
@@ -981,10 +989,11 @@ def model_picked(value):
 
 
 def test_model_raising_broken_variant_itself_gets_the_compiled_one():
+    files = compile_models([model_picked], Compilation.MODEL_CHECKER)
+    assert files["_pymagic.py"].endswith(BROKEN_VARIANT_CLASS)
     checker = compiled([model_picked], Compilation.MODEL_CHECKER)
-    assert BROKEN_VARIANT_CLASS in checker and "import" not in checker
-    namespace = {"magic": lambda: None}
-    exec(checker, namespace)
+    assert "from ._pymagic import BrokenVariant\n" in checker and absolute_imports(checker) == []
+    namespace = run_compiled([model_picked], Compilation.MODEL_CHECKER, {"magic": lambda: None}, files)
     with pytest.raises(namespace["BrokenVariant"], match="nothing to pick"):
         namespace["picked"](1)
 
@@ -1113,9 +1122,36 @@ def test_installing_a_concrete_package_keeps_the_real_effects_it_calls(tmp_path)
     assert installed(files, tmp_path, script) == ["compiled.random", "True"]
 
 
+class Ticket:
+    # a class the models check against, but never make
+    pass
+
+
+TICKET = named(Ticket)
+
+
+def booked(seat):
+    return isinstance(seat, Ticket)
+
+
+@model(booked)
+def model_booked(seat):
+    held = magic(bool)
+    return held and isinstance(seat, TICKET)
+
+
+def test_named_object_is_the_original_in_a_run_and_a_stand_in_compiled():
+    assert TICKET is Ticket
+    assert run_model([model_booked], {THIS_MODULE: {booked: lambda seat: [True]}})(lambda: booked(Ticket()))
+    checker = compiled([model_booked], Compilation.MODEL_CHECKER)
+    assert "\n\nclass Ticket:\n    # named only: no model makes one\n    pass\n" in checker
+    assert "return held and isinstance(seat, Ticket)" in checker and absolute_imports(checker) == []
+    assert "from test_effecful import TICKET\n" in compiled([model_booked], Compilation.CONCRETE)
+
+
 def test_compile_writes_out_the_module_level_names_a_model_uses():
     checker = compiled([model_cap], Compilation.MODEL_CHECKER)
-    assert "\n\nLIMIT = 100\n" in checker and "import" not in checker
+    assert "\n\nLIMIT = 100\n" in checker and absolute_imports(checker) == []
     assert "def cap(value):\n    x = magic(int)\n" + checked("x", "int", "cap") + holds("x <= LIMIT", "cap") + \
         "    return x\n" in checker
 
@@ -1128,8 +1164,7 @@ def test_compile_magic_in_a_loop():
         "    return rolls\n"
     ) in checker
     draws = itertools.count(1)
-    namespace = {"magic": lambda kind: next(draws)}
-    exec(checker, namespace)
+    namespace = run_compiled([model_dice], Compilation.MODEL_CHECKER, {"magic": lambda kind: next(draws)})
     assert namespace["dice"](3) == [1, 2, 3]
     assert namespace["dice"](0) == []
     with pytest.raises(AssertionError):
@@ -1149,10 +1184,8 @@ def test_compile_magic_in_a_loop():
 
 
 def test_compiled_loop_draws_like_the_running_model():
-    checker = compiled([_model_roll], Compilation.MODEL_CHECKER)
     draws = iter([10, 20, 30, 40, 50])
-    namespace = {"magic": lambda kind: next(draws)}
-    exec(checker, namespace)
+    namespace = run_compiled([_model_roll], Compilation.MODEL_CHECKER, {"magic": lambda kind: next(draws)})
     by_position = {THIS_MODULE: {roll: lambda n: iter([10, 20, 30, 40, 50])}}
     assert namespace["roll"](3) == run_model([_model_roll], by_position)(lambda: roll(3)) == [10, 20, 30, 40, 50]
 
@@ -1160,8 +1193,7 @@ def test_compiled_loop_draws_like_the_running_model():
 def test_compile_magic_in_expressions():
     checker = compiled([_model_inc], Compilation.MODEL_CHECKER)
     assert "    x = magic() + 1\n    values = [magic()]\n    y = z = magic()\n" in checker
-    namespace = {"magic": iter([10, 20, 30]).__next__}
-    exec(checker, namespace)
+    namespace = run_compiled([_model_inc], Compilation.MODEL_CHECKER, {"magic": iter([10, 20, 30]).__next__})
     assert namespace["inc"](10) == [11, 20, 30, 30]
 
 
@@ -1172,7 +1204,7 @@ def test_compile_keeps_the_exceptions_a_model_raises():
         + holds("100 <= status_code <= 599", "request") + "    if status_code == 404:\n"
         "        raise NotFound(f'{url} was not found')\n    return status_code\n"
     ) in checker
-    assert "\n\nclass NotFound(Exception):\n    pass\n" in checker and "import" not in checker
+    assert "\n\nclass NotFound(Exception):\n    pass\n" in checker and absolute_imports(checker) == []
 
 
 def test_concrete_compile_checks_exceptions_against_the_model():
@@ -1336,7 +1368,7 @@ def test_compile_recognizes_magic_and_constraint_through_the_module():
     checker = compiled([model_number_qualified], Compilation.MODEL_CHECKER)
     assert "def number():\n    x = magic(int)\n" + checked("x", "int", "number") + holds("x > 0", "number") + \
         "    return x\n" in checker
-    assert "import" not in checker
+    assert absolute_imports(checker) == []
     namespace = {}
     exec(compiled([model_number_qualified], Compilation.CONCRETE), namespace)
     assert namespace["number"]() == 5
@@ -1400,6 +1432,143 @@ def test_command_line_reports_what_it_cannot_compile(capsys):
         command_line(["compile", "nowhere:models"])
     assert exit.value.code == 2
     assert "no models at nowhere:models" in capsys.readouterr().err
+
+class Lamp:
+    def __init__(self):
+        self.lit = False
+
+    def switch(self):
+        # flips a real lamp
+        self.lit = not self.lit
+        return self.lit
+
+
+class lamps:
+    # a copy of Lamp whose switch is an effect: switched on, a lamp lights unless its bulb has burnt out
+    @model(Lamp)
+    class Lamp:
+        def __init__(self):
+            self.lit = False
+
+        @model(Lamp.switch)
+        def switch(self):
+            lit = magic(bool)
+            constraint(not (self.lit and lit))
+            self.lit = lit
+            return lit
+
+
+def flicked(times):
+    lamp = Lamp()
+    return [lamp.switch() for _ in range(times)]
+
+
+def test_copy_methods_draw_from_the_magics_of_the_class_they_copy():
+    working = {Lamp: {Lamp.switch: lambda self: [not self.lit]}}
+    assert run_model([lamps.Lamp], working)(lambda: flicked(3)) == [True, False, True]
+    assert run_model([lamps.Lamp], {Lamp: {Lamp.switch: lambda self: [False]}})(lambda: flicked(2)) == [False, False]
+    with pytest.raises(BrokenVariant, match=r"drew \[True\] and broke constraint\(not \(self.lit and lit\)\)"):
+        run_model([lamps.Lamp], {Lamp: {Lamp.switch: lambda self: [True]}})(lambda: flicked(2))
+    with pytest.raises(RunningUnstatedModel, match="no magics were given"):
+        run_model([lamps.Lamp])(lambda: flicked(1))
+
+
+def test_compile_copy_methods_as_models():
+    checker = compiled([lamps.Lamp], Compilation.MODEL_CHECKER)
+    assert "@model" not in checker and "lamps" not in checker
+    assert "    def switch(self):\n        lit = magic(bool)\n" + checked("lit", "bool", "switch", "        ") + \
+        holds("not (self.lit and lit)", "switch", "        ") + "        self.lit = lit\n" in checker
+    switches = iter([True, False, True, True])
+    namespace = run_compiled([lamps.Lamp], Compilation.MODEL_CHECKER, {"magic": lambda kind: next(switches)})
+    lamp = namespace["Lamp"]()
+    assert [lamp.switch() for _ in range(3)] == [True, False, True]
+    with pytest.raises(AssertionError):
+        lamp.switch()
+
+
+import signal
+
+
+@model(signal.signal)
+def model_signal(signalnum, handler):
+    # sets a signal's handler, giving the one the process had: SIGKILL's and SIGSTOP's can't be set
+    previous = magic()
+    constraint(signalnum not in (signal.SIGKILL, signal.SIGSTOP))
+    return previous
+
+
+def test_compile_writes_enumerations_of_modules_the_models_stand_in_for():
+    handled = {signal: {signal.signal: lambda signalnum, handler: [signal.SIG_DFL]}}
+    assert run_model([model_signal], handled)(lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)) is signal.SIG_DFL
+    checker = compiled([model_signal], Compilation.MODEL_CHECKER)
+    assert "\n\nclass Signals(IntEnum):\n" in checker and "\n    SIGKILL = 9\n" in checker
+    # the message says the constraint as the model's source does
+    assert "    assert signalnum not in (Signals.SIGKILL, Signals.SIGSTOP), BrokenVariant('the values broke signalnum " \
+        "not in (signal.SIGKILL, signal.SIGSTOP): the model of signal rejected this call')\n" in checker
+    assert absolute_imports(checker) == ["from enum import IntEnum"]
+
+
+class Chatty:
+    # what its repr says, it asks told() for
+    def __repr__(self):
+        return f"<chatty {told(self)}>"
+
+
+def told(about):
+    return "real"
+
+
+@model(told)
+def model_told(about):
+    word = magic(str)
+    constraint(word != "")
+    return word
+
+
+def test_messages_show_arguments_whose_repr_runs_a_model():
+    with pytest.raises(BrokenVariant) as broken:
+        run_model([model_told], {THIS_MODULE: {told: lambda about: [""]}})(lambda: told(Chatty()))
+    assert str(broken.value).startswith("model_told(<test_effecful.Chatty object at 0x")
+    assert run_model([model_told], {THIS_MODULE: {told: lambda about: ["fine"]}})(lambda: repr(Chatty())) == \
+        "<chatty fine>"
+
+
+SIDES = 6
+HOURS = 6
+
+
+def nap():
+    return 1
+
+
+@model(nap)
+def model_nap():
+    hours = magic(int)
+    constraint(0 < hours <= HOURS)
+    return hours
+
+
+@model(random.choice)
+def model_die_choice(seq):
+    at = magic(int)
+    constraint(0 <= at < len(seq) <= SIDES)
+    return seq[at]
+
+
+def test_compile_writes_each_number_where_its_name_is_used():
+    # 6 is one object, but no module gets SIDES from the other's HOURS
+    files = compile_models([model_nap, model_die_choice], Compilation.MODEL_CHECKER)
+    assert "\n\nHOURS = 6\n" in files["test_effecful.py"] and "\n\nSIDES = 6\n" in files["random.py"]
+    assert not [line for source in files.values() for line in source.splitlines()
+                if line.startswith(("from .test_effecful", "from .random"))]
+
+
+def test_compile_places_what_a_c_module_defines_in_it():
+    import socket
+    from PyMagic.compile import home_of
+    assert [home_of(original) for original in (socket.gaierror, socket.socket, socket.getaddrinfo, random.randint)] \
+        == ["_socket", "socket", "socket", "random"]
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

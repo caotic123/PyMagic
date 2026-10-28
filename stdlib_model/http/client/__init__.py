@@ -5,7 +5,7 @@
 
 import http.client
 
-from PyMagic import model
+from PyMagic import model, named
 
 HTTP_PORT = 80
 HTTPS_PORT = 443
@@ -133,7 +133,7 @@ def _validate_host(host):
                          f"(found at least {match!r})")
 
 
-HTTPResponse = http.client.HTTPResponse  # named only
+HTTPResponse = named(http.client.HTTPResponse)
 
 
 # ------------------------------------------------------------------ the model

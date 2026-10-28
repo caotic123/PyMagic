@@ -39,7 +39,7 @@ from PyMagic import get_models
 
 # the modules the standard library models model, which the models reach only through them
 MODELLED_MODULES = {"binascii", "hashlib", "_hashlib", "zlib", "time", "random", "unicodedata", "encodings", "http",
-                    "socket", "re", "errno", "email"}
+                    "socket", "_socket", "re", "errno", "email"}
 
 # what the models name without running it: an identity or a class for isinstance(), which no model makes
 NAMED_ONLY = {"http.client.HTTPResponse", "email.message.Message", "socket._GLOBAL_DEFAULT_TIMEOUT"}
@@ -55,8 +55,10 @@ def library_uses(path, libraries=MODELLED_MODULES):
     in_decorators |= {id(node) for function in ast.walk(tree) if isinstance(function, ast.FunctionDef)
                       for assignment in ast.walk(function) if isinstance(assignment, ast.AnnAssign)
                       for node in ast.walk(assignment.annotation)}
-    bound = {alias.asname or alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import)
-             for alias in node.names if alias.name.split(".")[0] in libraries}
+    # the names imported libraries are bound to: their own, or what they're imported as
+    bound = {alias.asname or alias.name.split(".")[0]: alias.name if alias.asname else alias.name.split(".")[0]
+             for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
+             if alias.name.split(".")[0] in libraries}
     uses = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module.split(".")[0] in libraries:
@@ -66,7 +68,7 @@ def library_uses(path, libraries=MODELLED_MODULES):
             dotted = node
             while isinstance(parents.get(dotted), ast.Attribute):
                 dotted = parents[dotted]
-            uses.append((node.lineno, ast.unparse(dotted)))
+            uses.append((node.lineno, bound[node.id] + ast.unparse(dotted)[len(node.id):]))
     return uses
 
 def resolved(dotted):
@@ -93,8 +95,9 @@ def modelled_originals(all_models):
     return originals
 
 def improper_uses(path, all_models):
-    # the uses of the libraries a model file makes that are neither the models, by their originals' names, nor
-    # names only
+    # the uses of the libraries a model file makes that are neither the models, by their originals' names, names
+    # only, nor values, which compile as they are: numbers and the like, and enumerations
+    from PyMagic.compile import is_value
     originals = modelled_originals(all_models)
     return [(line, dotted) for line, dotted in library_uses(path)
-            if dotted not in NAMED_ONLY and resolved(dotted) not in originals]
+            if dotted not in NAMED_ONLY and not is_value(resolved(dotted)) and resolved(dotted) not in originals]

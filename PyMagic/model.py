@@ -19,6 +19,7 @@ class RunningUnstatedModel(BaseException):
     pass
 
 class BrokenVariant(BaseException):
+    # magic() values the original couldn't give: the model rejects the call they make
     pass
 
 class MissedModelObject(BaseException):
@@ -27,8 +28,24 @@ class MissedModelObject(BaseException):
 def name_of(obj):
     return getattr(obj, '__qualname__', obj)
 
+# whether a message is showing the arguments of a call: a repr() that runs models, as a socket's does, then shows
+# the arguments of their calls plainly
+showing = ContextVar("showing", default=False)
+
+def shown(value):
+    # value's repr() for a message, or the plain one when it fails or a repr() is showing already
+    if showing.get():
+        return object.__repr__(value)
+    token = showing.set(True)
+    try:
+        return repr(value)
+    except BaseException:
+        return object.__repr__(value)
+    finally:
+        showing.reset(token)
+
 def format_call(func, args, kwargs):
-    params = [repr(arg) for arg in args] + [f"{key}={value!r}" for key, value in kwargs.items()]
+    params = [shown(arg) for arg in args] + [f"{key}={shown(value)}" for key, value in kwargs.items()]
     return f"{name_of(func)}({', '.join(params)})"
 
 
@@ -48,6 +65,16 @@ def signature_of(original):
     except (TypeError, ValueError):
         # builtins like max have no signature to check calls against
         return None
+
+# the objects the models only name, by id: an identity, or a class for isinstance() that no model makes
+named_only = {}
+
+def named(original):
+    # marks an object the models only name, as an identity or a class for isinstance(), as no model makes one:
+    # in a run it is the original, and compiled for a model checker it is a stand-in for it, an empty class or an
+    # object(), so the compiled models don't import the module it comes from
+    named_only[id(original)] = original
+    return original
 
 def model(original):
     # marks a class or a function as the model of original; a function model must be called like the

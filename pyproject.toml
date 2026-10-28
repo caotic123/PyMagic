@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pymagic-models"
+version = "0.1.0"
+description = "Models of effectful functions: run them in place of the real effects, or compile them for a model checker"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Tiago Campos"}]
+keywords = ["models", "specifications", "effects", "mocking", "model checking", "testing"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Software Development :: Testing",
+]
+
+[project.optional-dependencies]
+httplib2 = ["httplib2>=0.32,<0.33"]
+test = ["pytest", "httplib2>=0.32,<0.33"]
+
+[project.scripts]
+pymagic = "PyMagic.cli:main"
+
+[project.urls]
+Repository = "https://github.com/caotic123/PyMagic-"
+
+[tool.setuptools]
+license-files = ["LICENSE", "NOTICES.md"]
+
+[tool.setuptools.packages.find]
+include = ["PyMagic*", "http_model*", "stdlib_model*"]

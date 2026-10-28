@@ -96,8 +96,14 @@ def run_model(models, magics=None):
             for kind, entry in get_models(models):
                 match kind:
                     case Model.COPY:
-                        # code in the run makes, checks and catches the copy in place of the original
+                        # code in the run makes, checks and catches the copy in place of the original; its @model
+                        # methods draw from the magics of the class it copies, as a class model's do
                         replace_everywhere(everywhere, entry.__model__, entry)
+                        for name, method, original in model_members(entry):
+                            if original is not None:
+                                generator = magic_generator_for(magics, entry.__model__, original, used)
+                                propagate_magic_values(stack, everywhere, method, original, generator,
+                                                       is_method=True, owner=entry, name=name)
                     case Model.CLASS:
                         # patch the class object itself, so every module and existing instance sees it
                         owner = entry.__model__

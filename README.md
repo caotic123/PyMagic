@@ -33,10 +33,18 @@ Just simply asking the LLM to find bugs using models/compiled models is enough t
 
 # How to use
 
-PyMagic needs Python 3.10 or later. The httplib2 model also needs `httplib2`, and the tests need `pytest`:
+PyMagic needs Python 3.10 or later. It's on PyPI as `pymagic-models`; the httplib2 model needs the `httplib2`
+extra:
 
 ```bash
-pip install httplib2 pytest
+pip install pymagic-models               # PyMagic and the standard library models
+pip install "pymagic-models[httplib2]"   # and the httplib2 model, with httplib2
+```
+
+You import it as `PyMagic`. From a clone of the repository, the tests run with `pytest`:
+
+```bash
+pip install -e ".[test]"
 python3.10 -m pytest          # the tests of PyMagic and of the models
 ```
 
@@ -167,6 +175,48 @@ No request leaves the machine. The model behaves as httplib2 does: the unknown h
 `ServerNotFoundError`, and redirects are followed, so a generator that routes by `uri` can answer
 `/fortune` with a `301` to `/fortune/today` and still get the fortune.
 
+## Model the network: sockets
+
+`stdlib_model` models `socket` too. A socket keeps the state Linux keeps for it: open or closed, bound, listening,
+connected, shut down. So the errors that state decides are raised as Linux raises them: `recv()` on a closed socket
+is `EBADF`, `send()` before `connect()` is `EPIPE`. What the network decides is magic: the descriptor a socket gets,
+whether a connection is made, what a peer sends. Code over sockets, here `http.client`, runs unchanged against a
+network written down:
+
+```python
+import http.client
+import socket
+
+from PyMagic import run_model
+from stdlib_model import models
+from stdlib_model.magics import network
+
+
+def fortune():
+    connection = http.client.HTTPConnection("cookies.example", timeout=5)
+    connection.request("GET", "/fortune")
+    return connection.getresponse().read().decode()
+
+
+def cookie_jar(request):
+    # the fortune cookie server: what it sends back to a request
+    return b"HTTP/1.0 200 OK\r\n\r\nYou will write a model today"
+
+
+web = network(hosts={"cookies.example": ["203.0.113.7"]}, peers={("203.0.113.7", 80): cookie_jar})
+```
+
+```python
+>>> run_model(models, web)(fortune)
+'You will write a model today'
+>>> run_model(models, web)(lambda: socket.create_connection(("nowhere.example", 80)))
+socket.gaierror: [Errno -2] Name or service not known
+```
+
+`network()` also takes clients that connect to a listening socket, and connects the two ends of a
+`socketpair()`. `real_network()` asks the real kernel and network instead, with a real socket under each of the
+model's. That is how the tests check the model against Linux: the same programs give the same outcomes on both.
+
 ## Compile a model
 
 A model compiles to a package of Python modules: one for each module the models stand in for, and an
@@ -221,8 +271,10 @@ From Python, `compile_models(models, Compilation.MODEL_CHECKER)` returns the pac
 # Command line
 
 ```
-python3.10 -m PyMagic compile MODELS [-o DIRECTORY] [--concrete] [--force]
+pymagic compile MODELS [-o DIRECTORY] [--concrete] [--force]
 ```
+
+`pymagic` is installed with the package; `python3.10 -m PyMagic` does the same.
 
 - `MODELS` is `module:attribute`, naming a model or a list of them, like `dice:randint` or
   `stdlib_model.random:_model_random`. A module alone, like `http_model`, compiles its `models` list.
@@ -238,5 +290,12 @@ python3.10 -m PyMagic compile MODELS [-o DIRECTORY] [--concrete] [--force]
 - `PyMagic/`: the library. `model.py` has `@model`, `magic()` and `constraint()`; `run.py` has `run_model`;
   `compile.py` has `compile_models`; `cli.py` has the command line.
 - `http_model/`: a model of httplib2, laid out as httplib2 is.
-- `stdlib_model/`: models of the standard library modules the httplib2 model reaches, a folder for each.
+- `stdlib_model/`: models of the standard library modules the httplib2 model reaches, and of sockets, a folder
+  for each. `stdlib_model/magics.py` has the magics that answer them: a clock, a seeded random generator, and a
+  network, written down or real.
 - `effecful.py`: small examples of models of `random.randint` and `input`.
+
+# License
+
+MIT, see `LICENSE`. The models copy code from httplib2 (MIT) and CPython (PSF License); `NOTICES.md` has their
+licenses and what was changed.

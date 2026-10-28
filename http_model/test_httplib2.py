@@ -751,11 +751,17 @@ def test_whole_model_compiles_to_a_package_that_names_no_model_or_library():
     assert {"__init__.py", "httplib2/__init__.py", "httplib2/error.py", "httplib2/decode.py", "httplib2/iri2uri.py",
             "_hashlib.py", "binascii.py", "zlib.py", "time.py", "random.py", "re.py", "socket.py", "unicodedata.py",
             "http/client.py", "encodings/idna.py"} <= set(files)
+    # the modules the models stand in for: what each compiled module (but the installer) is free of
+    modelled = {path.removesuffix(".py").removesuffix("/__init__").replace("/", ".") for path in files} - {"__init__", "_pymagic"}
     for path, source in files.items():
         tree = ast.parse(source)
-        imported = {alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
-        imported |= {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level == 0}
-        assert imported & {"PyMagic", "httplib2", "http_model", "stdlib_model", "pyparsing"} == set(), path
+        imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+        imported |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level == 0}
+        assert {name.split(".")[0] for name in imported} & {"PyMagic", "httplib2", "http_model", "stdlib_model", "pyparsing"} == set(), path
+        if path != "__init__.py":
+            assert imported & modelled == set(), path
+            assert "__model__" not in source and "@model" not in source, path
+    assert [path for path, source in files.items() if "class BrokenVariant" in source] == ["_pymagic.py"]
 
 def test_whole_model_runs_compiled_without_httplib2_or_pymagic(tmp_path):
     import subprocess

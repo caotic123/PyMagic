@@ -13,7 +13,8 @@ from enum import Enum, auto
 from inspect import Parameter, signature, isclass, unwrap, findsource
 
 from .model import (
-    BrokenVariant, Model, code_objects, constraint, get_models, magic, model, model_members, name_of, signature_of,
+    BrokenVariant, Model, code_objects, constraint, get_models, magic, model, model_members, name_of, named_only,
+    signature_of,
 )
 
 
@@ -45,12 +46,6 @@ def _elements(result, name):
         raise AssertionError(f"the real {name} returned {result!r}, which has no elements for its model's magic() calls") from None
     yield from values
     raise AssertionError(f"its model's magic() calls drew more values than the real {name} returned in {result!r}")'''
-
-# written into a module compiled for a model checker: what fails the assert of a constraint the values break
-BROKEN_VARIANT_HELPER = '''\
-class BrokenVariant(BaseException):
-    # magic() values the original couldn't give: the model rejects the call they make
-    pass'''
 
 LOOPS = (ast.For, ast.AsyncFor, ast.While, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
@@ -124,6 +119,19 @@ def is_literal(value):
         return False
     return type(again) is type(value) and again == value
 
+def home_of(original):
+    # the module an original belongs to: the one it names, unless that wraps the C module under it, which defines
+    # the original under the wrapper's name, as _socket defines socket.gaierror; then the C module, which the
+    # wrapper's compiled module imports from as the wrapper does
+    named = original.__module__
+    beneath = sys.modules.get("_" + named) if "." not in named else None
+    return "_" + named if getattr(beneath, original.__name__, None) is original else named
+
+def is_value(value):
+    # whether a model checker needs value as it is, written out rather than stood in for: a literal, or an
+    # enumeration or a member of one
+    return is_literal(value) or isinstance(value, Enum) or isinstance(value, type) and issubclass(value, Enum)
+
 def standard_home(value, name):
     # (module, attribute) of the standard library module that holds value, its public module first, or None
     owner = getattr(value, "__module__", None)
@@ -135,7 +143,10 @@ def standard_home(value, name):
     for module_name in modules:
         names = [key for key, held in vars(sys.modules.get(module_name, types)).items() if held is value]
         if names and module_name in sys.modules:
-            return module_name, name if name in names else min(names, key=lambda key: (key.startswith("_"), key))
+            # the name it's used by, else its own, else the most public one
+            own = getattr(value, "__name__", None)
+            return module_name, name if name in names else own if own in names else \
+                min(names, key=lambda key: (key.startswith("_"), key))
     return None
 
 def bound_names(tree):
@@ -562,6 +573,9 @@ def compile_concrete(func, original, node):
 
 # ------------------------------------------------------------------ the package
 
+# the module of the package holding what the models use of PyMagic itself, like BrokenVariant
+PYMAGIC_MODULE = "_pymagic"
+
 # written as the compiled package's __init__.py
 INSTALLER = '''\
 # installs the compiled models in place of their originals, as PyMagic's run_model does during a run, but for
@@ -668,6 +682,12 @@ def global_references(tree):
 
     def walk(node, scopes, class_bound):
         match node:
+            case ast.AnnAssign() if scopes:
+                # in a function, an annotated assignment doesn't evaluate its annotation
+                for part in (node.target, node.value):
+                    if part is not None:
+                        walk(part, scopes, class_bound)
+                return
             case ast.Name(id=name, ctx=ast.Load()):
                 if name not in class_bound and not any(name in scope for scope in scopes):
                     references.append(node)
@@ -761,7 +781,10 @@ class Package:
         self.pending = {}    # id(object): how to write the model placed under it, until it's written
         self.written = set()
         self.replaced = []   # (module holding an original, its name there, compiled module, the model's name)
+        # the top-level packages of the models and of PyMagic: their code is written out, wherever it's installed
+        self.model_packages = {__name__.split(".")[0]}
         self.modeled_by = {} # id(original): the model compiled for it
+        self.modelled = set() # the modules the models stand in for
 
     def module(self, name):
         if name not in self.modules:
@@ -770,10 +793,11 @@ class Package:
 
     def place_model(self, original, user, *aliases):
         # an original's model, under the original's name in the module it belongs to; one model each
-        home = original.__module__
+        home = home_of(original)
         if id(original) in self.placed:
             raise UncompilableModel(f"{self.modeled_by[id(original)]} and {user} both compile to {original.__name__} in {home}")
         self.modeled_by[id(original)] = user
+        self.modelled.add(home)
         self.place(original, home, original.__name__, user, *aliases)
         return home
 
@@ -793,8 +817,15 @@ class Package:
 
     # ---------------------------------------------------------------- the models
 
+    def is_model_code(self, module):
+        # whether module is code of the models, written into the package rather than imported: the models' own
+        # packages and PyMagic, or a module of this project that isn't installed
+        return module is not None and (module.__name__.split(".")[0] in self.model_packages or is_project(module))
+
     def add(self, kind, entry):
         # reserves where a model goes: under its original's name, in the module its original belongs to
+        if kind is not Model.PATCHES:
+            self.model_packages.add(defining_module(entry).__name__.split(".")[0])
         match kind:
             case Model.MODULE | Model.FUNCTION:
                 members = [(unwrap(member), original) for _, member, original in model_members(entry) if original] \
@@ -807,9 +838,9 @@ class Package:
                 original = entry.__model__
                 if not self.checker:
                     return  # concretely, the real effect raises and makes the real classes
-                self.place_model(original, entry.__qualname__, entry)
+                home = self.place_model(original, entry.__qualname__, entry)
                 self.pending[id(original)] = lambda entry=entry: self.write_copy(entry)
-                self.replace(original, original.__module__, original.__name__)
+                self.replace(original, home, original.__name__)
             case Model.CLASS:
                 if not self.checker:
                     raise UncompilableModel(
@@ -818,9 +849,9 @@ class Package:
                         f"checker"
                     )
                 original = entry.__model__
-                self.place_model(original, entry.__qualname__)
+                home = self.place_model(original, entry.__qualname__)
                 self.pending[id(original)] = lambda entry=entry: self.write_class(entry)
-                self.replace(original, original.__module__, original.__name__)
+                self.replace(original, home, original.__name__)
             case Model.PATCHES:
                 raise UncompilableModel(
                     f"the plain patches of {[name_of(function) for function in entry]} have no model to compile; "
@@ -872,15 +903,12 @@ class Package:
         self.module(home).blocks.append(ast.unparse(ast.fix_missing_locations(definition)))
 
     def write_copy(self, entry):
-        # a copy of a class, as its source has it, without its @model(); one of the standard library's keeps the
-        # original as __model__, which the models check against
+        # a copy of a class, as its source has it, without its @model(); its @model methods are compiled as model
+        # functions are
         original = entry.__model__
         home, local = self.placed[id(original)]
-        self.write_source(entry, home, local, entry.__qualname__)
-        if is_standard(original.__module__):
-            module_name, attribute = standard_home(original, original.__name__)
-            self.module(home).imports.add(f"import {module_name}")
-            self.module(home).blocks.append(f"{local}.__model__ = {module_name}.{attribute}")
+        methods = {name: (unwrap(member), modelled) for name, member, modelled in model_members(entry) if modelled}
+        self.write_source(entry, home, local, entry.__qualname__, methods)
 
     # ---------------------------------------------------------------- what the models use
 
@@ -913,16 +941,27 @@ class Package:
             target, label = name_node, name_node.id
             value = namespace.get(label, given.get(label))
             # a module's attribute that is a model, or anything of a project module, is referred to directly; a
-            # submodule is followed, to import it
+            # submodule is followed, to import it; so is a value of a module the models stand in for, written out
             while isinstance(value, types.ModuleType) and isinstance(parents.get(id(target)), ast.Attribute):
                 attribute = parents[id(target)].attr
                 held = getattr(value, attribute, None)
-                if not (id(held) in self.placed or is_project(value) or isinstance(held, types.ModuleType)):
+                if not (id(held) in self.placed or self.is_model_code(value) or isinstance(held, types.ModuleType)
+                        or self.checker and value.__name__ in self.modelled and is_value(held)):
                     break
                 target, value, label = parents[id(target)], held, attribute
-            if isinstance(value, types.ModuleType) and not is_project(value) and ast.unparse(target) == value.__name__:
+            if isinstance(value, types.ModuleType) and not self.is_model_code(value) and ast.unparse(target) == value.__name__:
+                if self.checker and value.__name__ in self.modelled:
+                    raise UncompilableModel(
+                        f"{user} uses {ast.unparse(parents.get(id(target), target))} of {value.__name__}, which the "
+                        f"models stand in for but don't model"
+                    )
                 self.module(home).imports.add(f"import {value.__name__}")  # `urllib.parse.urlsplit` stays as it is
                 continue
+            # a copy's original is the copy itself where there are no originals: in a module for a model checker
+            parent = parents.get(id(target))
+            if self.checker and isinstance(parent, ast.Attribute) and parent.attr == "__model__" and \
+                    getattr(value, "__model_kind__", None) is Model.COPY and id(value) in self.placed:
+                target = parent
             local = self.local_name(home, label, value, user, owner)
             if local != ast.unparse(target):
                 replacements[target] = local
@@ -933,17 +972,19 @@ class Package:
         module = self.module(home)
         if value is magic or value is constraint:
             return preferred
-        if value is BrokenVariant and self.checker:
-            if module.names.get("BrokenVariant", value) is not value:
-                raise UncompilableModel(f"{user} uses a BrokenVariant, which {home} has something else named")
-            module.names["BrokenVariant"] = value
-            module.helpers.add(BROKEN_VARIANT_HELPER)
-            return "BrokenVariant"
-        if preferred == "BrokenVariant" and self.checker:
+        if preferred == "BrokenVariant" and value is not BrokenVariant and self.checker:
             raise UncompilableModel(
                 f"{user} uses a BrokenVariant of its own, but the compiled module defines BrokenVariant as PyMagic's; "
                 f"rename it"
             )
+        if self.checker and is_literal(value) and not isinstance(value, (dict, list, set)):
+            # a value that can't change is written where it's used, under the name it has there: the same number
+            # may be another constant elsewhere
+            local = self.free_name(home, preferred, value)
+            if local not in module.names:
+                module.names[local] = value
+                module.blocks.append(f"{local} = {value!r}")
+            return local
         if id(value) in self.placed:
             self.write_pending(value)
             placed_home, placed_name = self.placed[id(value)]
@@ -951,18 +992,30 @@ class Package:
                 return placed_name
             return self.imported(home, preferred, value, relative_name(home, placed_home, self.packages()), placed_name)
         if isinstance(value, types.ModuleType):
-            if is_project(value):
+            if self.is_model_code(value):
                 raise UncompilableModel(f"{user} uses the module {value.__name__} as a whole, which isn't compiled")
             return self.imported(home, preferred, value, None, value.__name__)
         if is_literal(value) and self.checker:
+            # one that can change is one object, which every module refers to where it's written first
             local = self.free_name(home, preferred, value)
             self.place(value, home, local, user)
             module.blocks.append(f"{local} = {value!r}")
             return local
+        if self.checker and id(value) in named_only:
+            found = standard_home(value, preferred) or (value.__module__, value.__name__)
+            return self.stand_in(home, preferred, value, user, *found)
         if not is_literal(value) and (found := standard_home(value, preferred)):
+            if self.checker and found[0] in self.modelled:
+                if isinstance(value, Enum):
+                    # a member: its enumeration's, by name, or by value when it's a combination of flags
+                    kind = self.local_name(home, type(value).__name__, type(value), user, owner)
+                    return f"{kind}.{value.name}" if value.name in type(value).__members__ else f"{kind}({int(value)!r})"
+                if isinstance(value, type) and issubclass(value, Enum):
+                    return self.enumeration(home, preferred, value, user, *found)
+                return self.stand_in(home, preferred, value, user, *found)
             return self.imported(home, preferred, value, *found)
         defined_in = sys.modules.get(getattr(value, "__module__", None))
-        if is_installed(defined_in):
+        if is_installed(defined_in) and not self.is_model_code(defined_in):
             return self.imported(home, preferred, value, defined_in.__name__, value.__name__)
         if not self.checker:
             return self.imported(home, preferred, value, owner, preferred)
@@ -979,14 +1032,42 @@ class Package:
         self.module(home).imports.add(line)
         return local
 
+    def enumeration(self, home, preferred, value, user, module_name, attribute):
+        # an enumeration of a module the models stand in for, written from its members into its compiled module:
+        # its values are numbers, which a model checker needs as they are
+        if id(value) not in self.placed:
+            self.place(value, module_name, attribute, user)
+            base = next(kind for kind in value.__mro__[1:] if kind.__module__ == "enum")
+            base_name = self.local_name(module_name, base.__name__, base, user, module_name)
+            members = "".join(f"\n    {name} = {member.value!r}" for name, member in value.__members__.items())
+            self.module(module_name).blocks.append(f"class {attribute}({base_name}):" + (members or "\n    pass"))
+        return self.local_name(home, preferred, value, user, module_name)
+
+    def stand_in(self, home, preferred, value, user, module_name, attribute):
+        # what a model names of a module the models stand in for, but doesn't model: an empty class or an object
+        # in its compiled module, as no model makes one, nor needs more than its name
+        if not isinstance(value, type) and callable(value):
+            raise UncompilableModel(
+                f"{user} calls {module_name}.{attribute}, which the models stand in for but don't model"
+            )
+        if id(value) not in self.placed:
+            self.place(value, module_name, attribute, user)
+            self.module(module_name).blocks.append(
+                f"class {attribute}:\n    # named only: no model makes one\n    pass" if isinstance(value, type)
+                else f"{attribute} = object()  # named only: the models compare against it"
+            )
+        return self.local_name(home, preferred, value, user, module_name)
+
     def written_out(self, home, preferred, value, user, owner):
-        # a function, class or module-level value of the project, written into home from its source
-        if isinstance(value, (type, types.FunctionType)) and is_project(defining_module(value)):
-            local = self.free_name(home, value.__name__, value)
-            self.place(value, home, local, user)
-            self.write_source(value, home, local, user)
-            return local
-        found = assignment_of(value, owner)
+        # a function, class or module-level value of the project, written into home from its source; PyMagic's
+        # own go into the package's _pymagic module
+        if isinstance(value, (type, types.FunctionType)) and self.is_model_code(defining_module(value)):
+            where = PYMAGIC_MODULE if defining_module(value).__name__.split(".")[0] == __name__.split(".")[0] else home
+            local = self.free_name(where, value.__name__, value)
+            self.place(value, where, local, user)
+            self.write_source(value, where, local, user)
+            return local if where == home else self.local_name(home, preferred, value, user, owner)
+        found = assignment_of(value, owner, self.is_model_code)
         if found is None:
             raise UncompilableModel(
                 f"{user} uses {preferred}, {value!r}, which the compiled module can neither import nor write out"
@@ -1004,8 +1085,9 @@ class Package:
         self.module(home).blocks.append(rewritten(source, replacements).rstrip("\n"))
         return self.placed[id(value)][1]
 
-    def write_source(self, value, home, local, user):
-        # a function or class as its source has it, without @model(), with its references renamed for home
+    def write_source(self, value, home, local, user, methods=None):
+        # a function or class as its source has it, without @model(), with its references renamed for home; the
+        # methods of a class named in methods, {name: (function, original)}, compiled as model functions are
         module = defining_module(value)
         source = source_of(value, module)
         if source is None:
@@ -1013,11 +1095,22 @@ class Package:
         tree = ast.parse(source)
         namespace = vars(module)
         decorators = model_decorators(tree, namespace)
-        replacements = self.references(tree, namespace, module.__name__, home, user, dropped=decorators)
+        compiled = [node for node in getattr(tree.body[0], "body", [])
+                    if isinstance(node, ast.FunctionDef) and node.name in (methods or {})]
+        replacements = self.references(tree, namespace, module.__name__, home, user, dropped=decorators + compiled)
         lines = source.splitlines(keepends=True)
         for decorator in decorators:
             end = len(lines[decorator.end_lineno - 1].encode("utf-8"))
             replacements[Span(decorator.lineno, 0, decorator.end_lineno, end)] = ""
+        for method in compiled:
+            func, original = methods[method.name]
+            node = compile_function(func, original, self.compilation)[0]
+            node.name = method.name
+            self.resolve_tree(node, func.__globals__, func.__module__, home, f"{user}.{method.name}")
+            first = min([method.lineno] + [decorator.lineno for decorator in method.decorator_list])
+            end = len(lines[method.end_lineno - 1].encode("utf-8"))
+            text = textwrap.indent(ast.unparse(ast.fix_missing_locations(node)), " " * method.col_offset) + "\n"
+            replacements[Span(first, 0, method.end_lineno, end)] = text
         definition = tree.body[0]
         if local != definition.name:
             line = lines[definition.lineno - 1]
@@ -1037,7 +1130,7 @@ class Package:
         # standard library's, for a model checker
         if not self.checker:
             return []
-        return [(name, name) for name in sorted(self.modules) if not is_standard(name) and self.modules[name].blocks]
+        return [(name, name) for name in sorted(self.modelled) if not is_standard(name)]
 
     def reexport(self):
         # a module standing in for another keeps the names it has for what's compiled in other modules
@@ -1080,7 +1173,8 @@ def defining_module(value):
         return found is value
     if named is not None and holds(named):
         return named
-    return next((module for module in list(sys.modules.values()) if is_project(module) and holds(module)), named)
+    return next((module for module in list(sys.modules.values())
+                 if module is not None and not is_standard(module.__name__) and holds(module)), named)
 
 def source_of(value, module):
     # the source of a function or class in module, decorators included and dedented, found by its qualified name
@@ -1101,12 +1195,12 @@ def source_of(value, module):
 def pretty(rows):
     return "[\n" + "".join(f"    {row!r},\n" for row in rows) + "]" if rows else "[]"
 
-def assignment_of(value, owner):
+def assignment_of(value, owner, is_model_code):
     # (module, statement, its source, the names it binds) of the module-level assignment that makes value, in the
-    # module whose code names it or another of the project's
-    candidates = [sys.modules.get(owner)] + [module for module in list(sys.modules.values()) if is_project(module)]
+    # module whose code names it or another of the models' code
+    candidates = [sys.modules.get(owner)] + [module for module in list(sys.modules.values()) if is_model_code(module)]
     for module in candidates:
-        if not is_project(module):
+        if not is_model_code(module):
             continue
         names = {name for name, held in vars(module).items() if held is value}
         if not names:

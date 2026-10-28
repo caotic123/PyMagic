@@ -1,6 +1,8 @@
 import errno
 import inspect
 import pathlib
+import socket
+import _socket
 from types import NoneType
 
 import pytest
@@ -16,6 +18,12 @@ COPIES = [entry for kind, entry in get_models(models) if kind is Model.COPY]
 PLAIN = (int, float, str, bytes, bool, NoneType, tuple, frozenset)
 NOT_COPIED = {"__module__", "__dict__", "__weakref__", "__model__", "__model_kind__"}
 
+# the members a copy leaves out, as the model doesn't model them
+LEFT_OUT = {
+    _socket.socket: {"recvmsg", "recvmsg_into", "sendmsg", "sendmsg_afalg"},
+    socket.socket: {"dup"},
+}
+
 def members(cls):
     return {name: value for name, value in vars(cls).items() if name not in NOT_COPIED}
 
@@ -24,7 +32,8 @@ def test_copy_has_the_properties_of_its_original(copy):
     # its original's members, plain values, docstring and bases, and no other public members: an original in C
     # keeps its state where Python can't, so a copy may add private ones
     original = copy.__model__
-    copied, own = members(copy), members(original)
+    copied = members(copy)
+    own = {name: value for name, value in members(original).items() if name not in LEFT_OUT.get(original, ())}
     assert own.keys() <= copied.keys()
     assert {name for name in copied.keys() - own.keys() if not name.startswith("_")} == set()
     assert {name: value for name, value in copied.items() if name in own and isinstance(value, PLAIN)} == \
@@ -40,8 +49,8 @@ def test_model_reaches_its_module_only_through_models(path):
     assert improper_uses(path, models) == []
 
 def test_errno_numbers_are_the_platforms():
-    for name in ("EOVERFLOW", "EADDRNOTAVAIL", "ENETUNREACH"):
-        assert getattr(model_errno, name) == getattr(errno, name)
+    numbers = {name: value for name, value in vars(model_errno).items() if name.startswith("E")}
+    assert numbers and numbers == {name: getattr(errno, name) for name in numbers}
 
 def test_every_folder_with_models_is_in_the_models():
     modelled = {pathlib.Path(inspect.getfile(entry)).parent for entry in models}
