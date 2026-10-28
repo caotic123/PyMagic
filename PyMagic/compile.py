@@ -111,6 +111,16 @@ INSTALLED = tuple(sysconfig.get_paths()[key] for key in ("purelib", "platlib"))
 def is_standard(module_name):
     return module_name == "builtins" or module_name.split(".")[0] in sys.stdlib_module_names
 
+# the standard library modules of the running process and the system around it, which a model checker can't run:
+# a module compiled for one takes their constants as literals, and imports nothing of them
+SYSTEM_MODULES = {
+    "sys", "os", "posix", "nt", "importlib", "subprocess", "signal", "threading", "_thread", "multiprocessing",
+    "socket", "_socket", "ssl", "select", "selectors", "time", "random",
+}
+
+def is_system(module_name):
+    return module_name.split(".")[0] in SYSTEM_MODULES
+
 def is_literal(value):
     # whether value's repr is a literal that evaluates back to it
     try:
@@ -118,6 +128,10 @@ def is_literal(value):
     except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
         return False
     return type(again) is type(value) and again == value
+
+def is_constant(value):
+    # a literal that can't change, which a model checker can have as it is wherever it's used
+    return is_literal(value) and not isinstance(value, (dict, list, set))
 
 def home_of(original):
     # the module an original belongs to: the one it names, unless that wraps the C module under it, which defines
@@ -576,35 +590,53 @@ def compile_concrete(func, original, node):
 # the module of the package holding what the models use of PyMagic itself, like BrokenVariant
 PYMAGIC_MODULE = "_pymagic"
 
-# written as the compiled package's __init__.py
-INSTALLER = '''\
-# installs the compiled models in place of their originals, as PyMagic's run_model does during a run, but for
-# good: each original the standard library holds is replaced wherever a loaded module holds it, and each other
-# module the models stand in for is the compiled one
-import sys
-import importlib
+def install(package):
+    # puts the models of the compiled package named package in place of their originals, as run_model does during
+    # a run, but for good: each original the standard library holds is replaced wherever a loaded module holds it,
+    # and each other module the models stand in for is the compiled one. Its source is written into a concrete
+    # package, which installs itself; one compiled for a model checker leaves it to the checker, or to this
+    import sys
+    import importlib
+    tables = importlib.import_module(package)
+    compiled = {name: importlib.import_module(name, package)
+                for name in sorted({c for _, _, c, _ in tables.REPLACED} | {c for _, c in tables.STANDING_IN})}
+    originals = [(getattr(importlib.import_module(module), name), getattr(compiled[c], local))
+                 for module, name, c, local in tables.REPLACED]
+    for original, model in originals:
+        # the compiled modules keep their originals: the real effects they call
+        for module in [module for name, module in list(sys.modules.items()) if not name.startswith(package + ".")]:
+            for key, value in list(getattr(module, "__dict__", {}).items()):
+                if value is original:
+                    setattr(module, key, model)
+    for module, c in tables.STANDING_IN:
+        sys.modules[module] = compiled[c]
 
+# what the compiled package's __init__.py says each compiled module stands in for
+TABLES = '''\
 # (module holding the original, its name there, compiled module, the model's name there)
 REPLACED = {replaced}
 
 # (module the models stand in for, compiled module)
 STANDING_IN = {standing_in}
+'''
 
+# written as the __init__.py of a package compiled for a model checker: nothing to run, nothing imported
+CHECKER_INIT = '''\
+# compiled from PyMagic models for a model checker: the originals each compiled module stands in for, which the
+# checker puts it in place of; in Python, PyMagic's install() does
 
-def install():
-    compiled = {{name: importlib.import_module(name, __name__) for name in sorted({{c for _, _, c, _ in REPLACED}} | {{c for _, c in STANDING_IN}})}}
-    originals = [(getattr(importlib.import_module(module), name), getattr(compiled[c], local)) for module, name, c, local in REPLACED]
-    for original, model in originals:
-        # the compiled modules keep their originals: the real effects they call
-        for module in [module for name, module in list(sys.modules.items()) if not name.startswith(__name__ + ".")]:
-            for key, value in list(getattr(module, "__dict__", {{}}).items()):
-                if value is original:
-                    setattr(module, key, model)
-    for module, c in STANDING_IN:
-        sys.modules[module] = compiled[c]
+{tables}'''
 
+# written as the __init__.py of a concretely compiled package, which installs it on import
+INSTALLER = '''\
+# compiled from PyMagic models with the real effects: importing the package installs them in place of their
+# originals
 
-install()
+{tables}
+
+{install}
+
+install(__name__)
 '''
 
 PACKAGE_INIT = "# compiled from PyMagic models: a package of compiled modules\n"
@@ -946,15 +978,17 @@ class Package:
                 attribute = parents[id(target)].attr
                 held = getattr(value, attribute, None)
                 if not (id(held) in self.placed or self.is_model_code(value) or isinstance(held, types.ModuleType)
-                        or self.checker and value.__name__ in self.modelled and is_value(held)):
+                        or self.checker and value.__name__ in self.modelled and is_value(held)
+                        or self.checker and is_system(value.__name__) and is_constant(held)):
                     break
                 target, value, label = parents[id(target)], held, attribute
             if isinstance(value, types.ModuleType) and not self.is_model_code(value) and ast.unparse(target) == value.__name__:
+                used = ast.unparse(parents.get(id(target), target))
                 if self.checker and value.__name__ in self.modelled:
                     raise UncompilableModel(
-                        f"{user} uses {ast.unparse(parents.get(id(target), target))} of {value.__name__}, which the "
-                        f"models stand in for but don't model"
+                        f"{user} uses {used} of {value.__name__}, which the models stand in for but don't model"
                     )
+                self.check_runnable(value.__name__, user, used)
                 self.module(home).imports.add(f"import {value.__name__}")  # `urllib.parse.urlsplit` stays as it is
                 continue
             # a copy's original is the copy itself where there are no originals: in a module for a model checker
@@ -977,7 +1011,7 @@ class Package:
                 f"{user} uses a BrokenVariant of its own, but the compiled module defines BrokenVariant as PyMagic's; "
                 f"rename it"
             )
-        if self.checker and is_literal(value) and not isinstance(value, (dict, list, set)):
+        if self.checker and is_constant(value):
             # a value that can't change is written where it's used, under the name it has there: the same number
             # may be another constant elsewhere
             local = self.free_name(home, preferred, value)
@@ -994,6 +1028,7 @@ class Package:
         if isinstance(value, types.ModuleType):
             if self.is_model_code(value):
                 raise UncompilableModel(f"{user} uses the module {value.__name__} as a whole, which isn't compiled")
+            self.check_runnable(value.__name__, user, preferred)
             return self.imported(home, preferred, value, None, value.__name__)
         if is_literal(value) and self.checker:
             # one that can change is one object, which every module refers to where it's written first
@@ -1013,6 +1048,7 @@ class Package:
                 if isinstance(value, type) and issubclass(value, Enum):
                     return self.enumeration(home, preferred, value, user, *found)
                 return self.stand_in(home, preferred, value, user, *found)
+            self.check_runnable(found[0], user, preferred)
             return self.imported(home, preferred, value, *found)
         defined_in = sys.modules.get(getattr(value, "__module__", None))
         if is_installed(defined_in) and not self.is_model_code(defined_in):
@@ -1020,6 +1056,14 @@ class Package:
         if not self.checker:
             return self.imported(home, preferred, value, owner, preferred)
         return self.written_out(home, preferred, value, user, owner)
+
+    def check_runnable(self, module_name, user, used):
+        # a module compiled for a model checker imports nothing of the process or the system
+        if self.checker and is_system(module_name):
+            raise UncompilableModel(
+                f"{user} uses {used} of {module_name}, which a model checker can't run; keep what the model needs of "
+                f"it in a module-level constant, which is written out as a literal, or model it"
+            )
 
     def imported(self, home, preferred, value, module_name, attribute):
         # value imported into home, as attribute of module_name, or as the module itself without one
@@ -1155,10 +1199,12 @@ class Package:
         for name in sorted(packages - set(self.modules)):
             files[module_file(name, packages)] = PACKAGE_INIT
         relative = lambda name: "." + name
-        files["__init__.py"] = INSTALLER.format(
+        tables = TABLES.format(
             replaced=pretty([(module, name, relative(home), local) for module, name, home, local in self.replaced]),
             standing_in=pretty([(module, relative(home)) for module, home in self.standing_in()]),
         )
+        files["__init__.py"] = CHECKER_INIT.format(tables=tables) if self.checker else \
+            INSTALLER.format(tables=tables, install=inspect.getsource(install))
         return files
 
 def defining_module(value):

@@ -707,8 +707,8 @@ def test_requests_run_none_of_the_libraries_modelled(routes, request_):
 
 # ------------------------------------------------------------------ compiled for a model checker
 
-from PyMagic import Compilation, compile_models
-from PyMagic.compile import write_package
+from PyMagic import Compilation, compile_models, install
+from PyMagic.compile import SYSTEM_MODULES, write_package
 
 RUN_COMPILED = """\
 import sys, json, builtins, importlib.abc
@@ -721,7 +721,8 @@ sys.meta_path.insert(0, Refuse())
 
 values = []
 builtins.magic = lambda *kinds: values.pop(0)
-import compiled, gzip, socket
+install("compiled")
+import gzip, socket
 import httplib2
 
 def run(draws, call):
@@ -751,22 +752,24 @@ def test_whole_model_compiles_to_a_package_that_names_no_model_or_library():
     assert {"__init__.py", "httplib2/__init__.py", "httplib2/error.py", "httplib2/decode.py", "httplib2/iri2uri.py",
             "_hashlib.py", "binascii.py", "zlib.py", "time.py", "random.py", "re.py", "socket.py", "unicodedata.py",
             "http/client.py", "encodings/idna.py"} <= set(files)
-    # the modules the models stand in for: what each compiled module (but the installer) is free of
+    # the modules the models stand in for: what each compiled module is free of, as it is of the system's
     modelled = {path.removesuffix(".py").removesuffix("/__init__").replace("/", ".") for path in files} - {"__init__", "_pymagic"}
     for path, source in files.items():
         tree = ast.parse(source)
         imported = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
         imported |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level == 0}
         assert {name.split(".")[0] for name in imported} & {"PyMagic", "httplib2", "http_model", "stdlib_model", "pyparsing"} == set(), path
-        if path != "__init__.py":
-            assert imported & modelled == set(), path
-            assert "__model__" not in source and "@model" not in source, path
+        assert {name.split(".")[0] for name in imported} & SYSTEM_MODULES == set(), path
+        assert imported & modelled == set(), path
+        assert "__model__" not in source and "@model" not in source, path
     assert [path for path, source in files.items() if "class BrokenVariant" in source] == ["_pymagic.py"]
 
 def test_whole_model_runs_compiled_without_httplib2_or_pymagic(tmp_path):
     import subprocess
     write_package(compile_models(models, Compilation.MODEL_CHECKER), tmp_path / "compiled")
-    run = subprocess.run([sys.executable, "-c", RUN_COMPILED], cwd=tmp_path, capture_output=True, text=True)
+    # installed as a model checker's harness would, without PyMagic
+    script = inspect.getsource(install) + RUN_COMPILED
+    run = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
     assert run.stdout.splitlines() == [
         "b'{\"name\": \"lol\"}'",

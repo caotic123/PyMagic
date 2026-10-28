@@ -1,4 +1,7 @@
+import os
+import ast
 import sys
+import inspect
 import random
 import builtins
 import itertools
@@ -11,7 +14,8 @@ import PyMagic
 from PyMagic.compile import PACKAGE_INIT, write_package
 from PyMagic import (
     BrokenVariant, MissedModelObject, RunningUnstatedModel, UncompilableModel,
-    Compilation, Model, collect_magic, compile_models, constraint, get_models, magic, model, named, run_model,
+    Compilation, Model, collect_magic, compile_models, constraint, get_models, install, magic, model, named,
+    run_model,
 )
 from effecful import magics, magics_by_name, models, simple, _model_Random
 
@@ -1098,11 +1102,11 @@ def test_compile_copies_under_their_originals_names():
     assert "raise Refused(f'{question} no', 403) from KeyError(question)" in checker
 
 
-def installed(files, tmp_path, script, before=""):
-    # what a script prints in a Python that runs before, then imports the compiled package, with magic() drawing 4
+def installed(files, tmp_path, script, before="", installing="install('compiled')\n"):
+    # what a script prints in a Python that runs before, then installs the compiled package, with magic() drawing 4
     import subprocess
     write_package(files, tmp_path / "compiled")
-    preamble = f"import builtins\nbuiltins.magic = lambda *kinds: 4\n{before}import compiled\n"
+    preamble = f"{inspect.getsource(install)}\nimport builtins\nbuiltins.magic = lambda *kinds: 4\n{before}{installing}"
     run = subprocess.run([sys.executable, "-c", preamble + script], cwd=tmp_path, capture_output=True, text=True)
     assert run.returncode == 0, run.stderr
     return run.stdout.split()
@@ -1116,10 +1120,50 @@ def test_installing_the_package_puts_the_models_in_place_of_the_originals(tmp_pa
         ["compiled.random", "compiled.random", "compiled.builtins", "4"]
 
 
+def test_a_package_for_a_model_checker_says_what_it_stands_in_for_and_runs_nothing():
+    init = compile_models(models, Compilation.MODEL_CHECKER)["__init__.py"]
+    assert absolute_imports(init) == []
+    assert [type(statement) for statement in ast.parse(init).body] == [ast.Assign, ast.Assign]
+    assert "    ('random', 'randint', '.random', 'randint'),\n" in init
+
+
+def byte_order():
+    return sys.byteorder
+
+
+@model(byte_order)
+def model_byte_order():
+    order = magic(str)
+    constraint(order == sys.byteorder)
+    return order
+
+
+def parent_id():
+    return os.getppid()
+
+
+@model(parent_id)
+def model_parent_id():
+    pid = magic(int)
+    constraint(pid != os.getpid())
+    return pid
+
+
+def test_compile_for_a_model_checker_writes_the_systems_constants_and_imports_nothing_of_it():
+    checker = compiled([model_byte_order], Compilation.MODEL_CHECKER)
+    assert f"\n\nbyteorder = {sys.byteorder!r}\n" in checker and "assert order == byteorder, " in checker
+    assert absolute_imports(checker) == []
+    with pytest.raises(UncompilableModel, match="model_parent_id uses os.getpid of os, which a model checker can't run"):
+        compile_models([model_parent_id], Compilation.MODEL_CHECKER)
+    # concretely, it runs in Python, which runs the system too
+    assert "import os" in compiled([model_parent_id], Compilation.CONCRETE)
+
+
 def test_installing_a_concrete_package_keeps_the_real_effects_it_calls(tmp_path):
     files = compile_models(models, Compilation.CONCRETE)
     script = "import random\nprint(random.randint.__module__, all(1 <= random.randint(1, 6) <= 6 for _ in range(20)))"
-    assert installed(files, tmp_path, script) == ["compiled.random", "True"]
+    # importing it installs it
+    assert installed(files, tmp_path, script, installing="import compiled\n") == ["compiled.random", "True"]
 
 
 class Ticket:

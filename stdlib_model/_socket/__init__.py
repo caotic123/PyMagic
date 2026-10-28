@@ -12,7 +12,6 @@
 
 import _socket
 import math
-import os
 import sys
 from operator import index
 from types import NoneType
@@ -270,6 +269,10 @@ def is_ipv6(text):
 
 # ------------------------------------------------------------------ addresses
 
+# how a str path of AF_UNIX becomes bytes for the kernel and back, as os.fsencode() and os.fsdecode() do it
+FS_ENCODING = sys.getfilesystemencoding()
+FS_ERRORS = sys.getfilesystemencodeerrors()
+
 def host_bytes(host):
     # a host as _socket hands it to the kernel: bytes, or a str in IDNA unless it's ASCII
     if isinstance(host, (bytes, bytearray)):
@@ -335,11 +338,11 @@ def address_of(family, address, caller):
             raise OverflowError(f"{caller}(): flowinfo must be 0-1048575.")
         return host, port, flowinfo, scope_id
     if family == AF_UNIX:
-        path = octets(os.fsencode(address) if isinstance(address, str) else address)
+        path = octets(address.encode(FS_ENCODING, FS_ERRORS) if isinstance(address, str) else address)
         if len(path) > (108 if path[:1] in (b"", b"\0") else 107):
             raise OSError("AF_UNIX path too long")
         # an abstract one stays bytes; "" binds to one the kernel picks, which stays b"" until it's asked
-        return path if path[:1] in (b"", b"\0") else os.fsdecode(path)
+        return path if path[:1] in (b"", b"\0") else path.decode(FS_ENCODING, FS_ERRORS)
     return address
 
 def connected_to(peer):

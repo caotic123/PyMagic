@@ -220,8 +220,12 @@ model's. That is how the tests check the model against Linux: the same programs 
 ## Compile a model
 
 A model compiles to a package of Python modules: one for each module the models stand in for, and an
-`__init__.py` that installs them in place of the originals. Compiled for a model checker, `magic()` is left for
-the checker to supply, and constraints become asserts that fail with a `BrokenVariant`. With the dice game saved
+`__init__.py` that says which original each model stands in for. Compiled for a model checker, `magic()` is left
+for the checker to supply, and constraints become asserts that fail with a `BrokenVariant`. The package imports
+nothing of the system a checker can't run, like `sys`, `os` or `socket`: what the models read of it, like
+`sys.byteorder`, is written in as a literal, and a model that calls into it doesn't compile. Its `__init__.py`
+runs nothing either: putting the models in place of the originals is the checker's job, or, in Python,
+`install(package)`'s. Compiled concretely, the package installs itself when imported. With the dice game saved
 as `dice.py`:
 
 ```bash
@@ -247,12 +251,13 @@ Running the compiled model with `magic()` supplied, as a model checker would sup
 
 ```python
 import sys, builtins
+from PyMagic import install
 sys.path.insert(0, "out")
 
 landing = iter([3, 3, 9, 2])
 builtins.magic = lambda *kinds: next(landing)   # what a model checker supplies
 
-import compiled                                 # random.randint is the compiled model now
+install("compiled")                             # random.randint is the compiled model now
 from dice import play
 
 play()    # 'doubles: you win a pizza'
@@ -288,7 +293,7 @@ pymagic compile MODELS [-o DIRECTORY] [--concrete] [--force]
 # What's here
 
 - `PyMagic/`: the library. `model.py` has `@model`, `magic()` and `constraint()`; `run.py` has `run_model`;
-  `compile.py` has `compile_models`; `cli.py` has the command line.
+  `compile.py` has `compile_models` and `install`; `cli.py` has the command line.
 - `http_model/`: a model of httplib2, laid out as httplib2 is.
 - `stdlib_model/`: models of the standard library modules the httplib2 model reaches, and of sockets, a folder
   for each. `stdlib_model/magics.py` has the magics that answer them: a clock, a seeded random generator, and a
