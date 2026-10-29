@@ -5,10 +5,9 @@ from .model import (
     named,
 )
 from .run import run_model
-from .compile import Compilation, UncompilableModel, compile_models, install
+from .compile import Compilation, UncompilableModel, compile_models
 
 __all__ = [
     "BrokenVariant", "Compilation", "MissedModelObject", "Model", "RunningUnstatedModel", "UncompilableModel",
-    "collect_magic", "compile_models", "constraint", "get_models", "install", "magic", "model", "named",
-    "run_model",
+    "collect_magic", "compile_models", "constraint", "get_models", "magic", "model", "named", "run_model",
 ]

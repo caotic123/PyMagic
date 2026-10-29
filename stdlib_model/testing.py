@@ -41,8 +41,10 @@ from PyMagic import get_models
 MODELLED_MODULES = {"binascii", "hashlib", "_hashlib", "zlib", "time", "random", "unicodedata", "encodings", "http",
                     "socket", "_socket", "re", "errno", "email"}
 
-# what the models name without running it: an identity or a class for isinstance(), which no model makes
-NAMED_ONLY = {"http.client.HTTPResponse", "email.message.Message", "socket._GLOBAL_DEFAULT_TIMEOUT"}
+# what the models name without running it: an identity or a class for isinstance(), which no model makes, or an
+# exception they raise as it is
+NAMED_ONLY = {"http.client.HTTPResponse", "email.message.Message", "socket._GLOBAL_DEFAULT_TIMEOUT", "binascii.Error",
+              "zlib.error"}
 
 def library_uses(path, libraries=MODELLED_MODULES):
     # (line, dotted name) of each use a model file makes of the libraries' modules outside @model() decorators

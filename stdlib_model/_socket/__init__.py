@@ -11,7 +11,6 @@
 # aren't modelled
 
 import _socket
-import math
 import sys
 from operator import index
 from types import NoneType
@@ -142,12 +141,15 @@ def timeout_ns(value):
     if value is None:
         return None
     if isinstance(value, float):
-        if math.isnan(value):
+        if value != value:
             raise ValueError("Invalid value NaN (not a number)")
         scaled = value * NS
         if not -2.0**63 <= scaled < 2.0**63:
             raise OverflowError("timestamp too large to convert to C _PyTime_t")
-        ns = math.ceil(scaled) if scaled >= 0 else math.floor(scaled)
+        # toward zero, then away from it if a fraction is left
+        ns = int(scaled)
+        if ns != scaled:
+            ns += 1 if scaled > 0 else -1
     else:
         try:
             ns = c_long(value) * NS

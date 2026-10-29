@@ -58,6 +58,8 @@ Summary of the changes made to it:
   model rather than asking `os`, and sends files with `send()`; what `socket` does for platforms other than Linux
   is left out.
 - `_socket`: the docstring of `_socket.socket`.
+- `binascii`: `a2b_base64` follows `binascii_a2b_base64_impl` of `Modules/binascii.c`, written in Python.
+- `http_model/` computes HMAC as `hmac.HMAC` does over a hash constructor, written as one function.
 
 ```
 PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2

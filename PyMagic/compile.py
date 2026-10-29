@@ -7,9 +7,13 @@ import types
 import inspect
 import builtins
 import textwrap
+import functools
 import itertools
 import sysconfig
+import importlib.util
+import importlib.machinery
 from enum import Enum, auto
+from collections import deque
 from inspect import Parameter, signature, isclass, unwrap, findsource
 
 from .model import (
@@ -534,7 +538,7 @@ def compile_concrete(func, original, node):
             f"so give the model the same defaults"
         )
     module_name, reference = reference_to(original)
-    # the real effect as the compiled module finds it on import, before installing puts the model in its place
+    # the real effect as the compiled module finds it on import, before the model is put in its place
     real_call = ast.Call(ast.Name(f"_real_{node.name}", ast.Load()), *passed_on(node.args))
 
     compiler = ModelCompiler(func, node.name, Compilation.CONCRETE)
@@ -585,58 +589,187 @@ def compile_concrete(func, original, node):
         )
     return node, helpers, (module_name, reference)
 
+# ------------------------------------------------------------------ C specs
+
+# the C modules of CPython that Python's own semantics rest on, which every Python has: the interpreter's
+# (builtins, sys, imports, marshal, I/O, threads, weak references, warnings, abstract classes, codecs), and those
+# the pure modules of the standard library are written over (string formatting, regular expressions, itertools,
+# and the cores of collections, functools and operator). A package compiled with no C specs needs no other C module
+PYTHON_SEMANTICS = {
+    "builtins", "sys", "_imp", "marshal", "_io", "_thread", "_weakref", "_warnings", "_abc", "_codecs", "_string",
+    "_sre", "itertools", "_collections", "_functools", "_operator",
+}
+
+# what a try catches that lets a module go on without the C module it tries: CPython's way to a pure fallback
+GOING_ON = {"ImportError", "ModuleNotFoundError", "Exception", "BaseException"}
+
+def spec_of(name):
+    # the spec of a module, found without running it or the packages above it; None where there's no such module
+    module = sys.modules.get(name)
+    if getattr(module, "__spec__", None) is not None:
+        return module.__spec__
+    above, _, _ = name.rpartition(".")
+    if not above:
+        try:
+            return importlib.util.find_spec(name)
+        except ValueError:
+            return None
+    package = spec_of(above)
+    if package is None or package.submodule_search_locations is None:
+        return None
+    return importlib.machinery.PathFinder.find_spec(name, package.submodule_search_locations)
+
+def is_c_spec(spec):
+    # whether a module is written in C: built into the interpreter, or a shared library
+    return spec.origin == "built-in" or isinstance(spec.loader, importlib.machinery.ExtensionFileLoader)
+
+def with_packages(name):
+    # a module and the packages above it, which importing it runs first
+    parts = name.split(".")
+    return [".".join(parts[:count]) for count in range(1, len(parts) + 1)]
+
+def goes_on_without(statement):
+    # whether a try goes on when what it imports isn't there: it has a handler for the ImportError that doesn't
+    # just raise again
+    for handler in statement.handlers:
+        caught = {node.id for node in ast.walk(handler.type) if isinstance(node, ast.Name)} if handler.type else GOING_ON
+        if caught & GOING_ON and not all(isinstance(line, ast.Raise) for line in handler.body):
+            return True
+    return False
+
+def never_runs(test):
+    # whether an if's test is false whenever a module is imported: it's run as the main program, or type-checked
+    match test:
+        case ast.Compare(left=ast.Name(id="__name__"), ops=[ast.Eq()], comparators=[ast.Constant(value="__main__")]):
+            return True
+        case ast.Name(id="TYPE_CHECKING") | ast.Attribute(attr="TYPE_CHECKING"):
+            return True
+    return False
+
+def inner_statements(statement):
+    # the statements a compound statement holds: its bodies, and its handlers' and cases'
+    inner = [line for field in ("body", "orelse", "finalbody") for line in getattr(statement, field, [])
+             if isinstance(line, ast.stmt)]
+    return inner + [line for nested in getattr(statement, "handlers", []) + getattr(statement, "cases", [])
+                    for line in nested.body]
+
+def imported_by(statements, package, running, find=spec_of):
+    # the modules statements import, with the packages above them; their relative imports are from package, or
+    # left out without one. Running, those they may import as they run: not those of their functions or of their
+    # ifs that never run on import, nor those of a try that goes on without them, but those of its handlers, else
+    # and finally, which may run: a missing C module makes handlers run (hashlib without its C hashes imports
+    # logging in one). find gives a module's spec, or None
+    found = []
+    for statement in statements:
+        match statement:
+            case ast.Import(names=aliases):
+                found += [name for alias in aliases for name in with_packages(alias.name)]
+            case ast.ImportFrom(module=module, names=aliases, level=level):
+                try:
+                    base = importlib.util.resolve_name("." * level + (module or ""), package) if level else module
+                except (ImportError, ValueError):
+                    continue  # relative, out of no package or beyond the top one, which fails as it runs
+                found += with_packages(base)
+                # what it takes from a package may be its submodules
+                found += [f"{base}.{alias.name}" for alias in aliases if find(f"{base}.{alias.name}") is not None]
+            case ast.FunctionDef() | ast.AsyncFunctionDef() if running:
+                pass
+            case ast.If(test=test, orelse=orelse) if running and never_runs(test):
+                found += imported_by(orelse, package, running, find)
+            case ast.Try() if running and goes_on_without(statement):
+                handled = [line for handler in statement.handlers for line in handler.body]
+                found += imported_by(handled + statement.orelse + statement.finalbody, package, running, find)
+            case _:
+                found += imported_by(inner_statements(statement), package, running, find)
+    return found
+
+def library_spec(name):
+    # the spec of a frozen module's source in the library, as Python 3.11 freezes os, io and codecs; None where
+    # there's none, as for the import system's own
+    above, _, _ = name.rpartition(".")
+    if not above:
+        return importlib.machinery.PathFinder.find_spec(name)
+    package = spec_of(above)
+    if package is None or package.submodule_search_locations is None:
+        return None
+    return importlib.machinery.PathFinder.find_spec(name, package.submodule_search_locations)
+
+def c_specs_needed(files):
+    # the C modules a compiled package needs that aren't Python's own, each as the chain of imports that needs it:
+    # from a compiled module, through the modules it imports and what they may import as they run, to the C module
+    find = functools.lru_cache(maxsize=None)(spec_of)
+    chains, waiting, needed = {}, deque(), []
+    for path, source in sorted(files.items()):
+        for name in imported_by(ast.parse(source).body, None, False, find):
+            if name not in chains:
+                chains[name] = [path, name]
+                waiting.append(name)
+    while waiting:
+        name = waiting.popleft()
+        spec = find(name)
+        if spec is not None and spec.origin == "frozen":
+            spec = library_spec(spec.name)
+        if spec is None or spec.origin is None:
+            continue
+        if is_c_spec(spec):
+            if name not in PYTHON_SEMANTICS:
+                needed.append(chains[name])
+            continue
+        # under the name it has, which a module may not (os.path is posixpath)
+        try:
+            source = spec.loader.get_source(spec.name)
+        except (ImportError, OSError):
+            source = None
+        if source is None:
+            raise UncompilableModel(
+                f"with no C specs, what the package imports is read from its source, and {name} has none, as "
+                f"{chains[name][0]} imports {', which imports '.join(chains[name][1:])}"
+            )
+        package = spec.name if spec.submodule_search_locations is not None else spec.name.rpartition(".")[0]
+        for found in imported_by(ast.parse(source).body, package, True, find):
+            if found not in chains:
+                chains[found] = chains[name] + [found]
+                waiting.append(found)
+    return needed
+
 # ------------------------------------------------------------------ the package
 
 # the module of the package holding what the models use of PyMagic itself, like BrokenVariant
 PYMAGIC_MODULE = "_pymagic"
 
-def install(package):
-    # puts the models of the compiled package named package in place of their originals, as run_model does during
-    # a run, but for good: each original the standard library holds is replaced wherever a loaded module holds it,
-    # and each other module the models stand in for is the compiled one. Its source is written into a concrete
-    # package, which installs itself; one compiled for a model checker leaves it to the checker, or to this
-    import sys
-    import importlib
-    tables = importlib.import_module(package)
-    compiled = {name: importlib.import_module(name, package)
-                for name in sorted({c for _, _, c, _ in tables.REPLACED} | {c for _, c in tables.STANDING_IN})}
-    originals = [(getattr(importlib.import_module(module), name), getattr(compiled[c], local))
-                 for module, name, c, local in tables.REPLACED]
-    for original, model in originals:
-        # the compiled modules keep their originals: the real effects they call
-        for module in [module for name, module in list(sys.modules.items()) if not name.startswith(package + ".")]:
-            for key, value in list(getattr(module, "__dict__", {}).items()):
-                if value is original:
-                    setattr(module, key, model)
-    for module, c in tables.STANDING_IN:
-        sys.modules[module] = compiled[c]
+# the compiled package's __init__.py: the originals its modules stand in for. Nothing in it runs or imports, and
+# nothing in the package puts a model in place: whoever runs the package does, as the tables say
+PACKAGE_TABLES = '''\
+# compiled from PyMagic models: the originals the compiled modules stand in for, which whoever runs the package
+# puts the models in place of, as these tables say and nothing else:
+# - a compiled module is named relative to this package, and stands in for the real module of its name
+# - REPLACED has a row for every name a standard library module binds an original to, of those loaded while
+#   compiling (the modules the models and their originals import), its own module's own name first; the rows of
+#   a real module the package compiles name the model as they name the original
+{placing}
+# - a module in STANDING_IN is stood in for whole, and so is every package above it
 
-# what the compiled package's __init__.py says each compiled module stands in for
-TABLES = '''\
-# (module holding the original, its name there, compiled module, the model's name there)
+# (real module, the original's name there, compiled module, the model's name there)
 REPLACED = {replaced}
 
-# (module the models stand in for, compiled module)
+# (real module, compiled module)
 STANDING_IN = {standing_in}
 '''
 
-# written as the __init__.py of a package compiled for a model checker: nothing to run, nothing imported
-CHECKER_INIT = '''\
-# compiled from PyMagic models for a model checker: the originals each compiled module stands in for, which the
-# checker puts it in place of; in Python, PyMagic's install() does
+# how the models of a package are put in place, for each compilation: in a Python without the C module a model
+# checker's package compiles, its compiled module stands in for it whole; a concrete package needs the real modules
+PLACING = {
+    Compilation.MODEL_CHECKER: "# - where there is no C module the package compiles, its compiled module stands in for it whole",
+    Compilation.CONCRETE: "# - the compiled modules call the real ones, which stay: each model goes in place of its original alone",
+}
 
-{tables}'''
-
-# written as the __init__.py of a concretely compiled package, which installs it on import
-INSTALLER = '''\
-# compiled from PyMagic models with the real effects: importing the package installs them in place of their
-# originals
-
-{tables}
-
-{install}
-
-install(__name__)
+# the __init__.py of a package compiled to run in pure Python: comments alone, naming the real modules
+PURE_INIT = '''\
+# compiled from PyMagic models to run in pure Python, needing no C module but those Python's own semantics rest
+# on. Nothing here runs: each compiled module stands in for the real module of its name, and holds the models of
+# these real objects, under the names after the arrows
+#
+{lines}
 '''
 
 PACKAGE_INIT = "# compiled from PyMagic models: a package of compiled modules\n"
@@ -803,16 +936,18 @@ class CompiledModule:
 class Package:
     # the compiled modules, one for each module the models stand in for: each model under its original's name,
     # and what the models use, written from its source, imported, or written as a literal; then __init__.py, which
-    # installs them
-    def __init__(self, compilation):
+    # says what they stand in for
+    def __init__(self, compilation, no_c_spec=False, pure=False):
         self.compilation = compilation
         self.checker = compilation is Compilation.MODEL_CHECKER
+        self.pure = pure                     # to run in pure Python: its __init__.py names the real modules alone
+        self.no_c_spec = no_c_spec or pure   # needing no C module but those Python's semantics rest on
         self.modules = {}
         self.placed = {}     # id(object): (compiled module, its name there) for every model and what's written
         self.objects = {}    # id(object): object, to keep what placed refers to alive
         self.pending = {}    # id(object): how to write the model placed under it, until it's written
         self.written = set()
-        self.replaced = []   # (module holding an original, its name there, compiled module, the model's name)
+        self.replaced = []   # (original, its home, the model's name there) for each original the tables replace
         # the top-level packages of the models and of PyMagic: their code is written out, wherever it's installed
         self.model_packages = {__name__.split(".")[0]}
         self.modeled_by = {} # id(original): the model compiled for it
@@ -891,12 +1026,9 @@ class Package:
                 )
 
     def replace(self, original, home, local):
-        # how installing puts the model in place of a standard library original, or, concretely, of any original
+        # an original the tables replace with its model: one the standard library holds, or, concretely, any
         if not self.checker or is_standard(home):
-            module = sys.modules[home]
-            # its name there, or its own when something else stands there now, as in a test's patch
-            name = next((key for key, value in vars(module).items() if value is original), original.__name__)
-            self.replaced.append((home, name, home, local))
+            self.replaced.append((original, home, local))
 
     def write_pending(self, value):
         if id(value) in self.pending:
@@ -979,6 +1111,7 @@ class Package:
                 held = getattr(value, attribute, None)
                 if not (id(held) in self.placed or self.is_model_code(value) or isinstance(held, types.ModuleType)
                         or self.checker and value.__name__ in self.modelled and is_value(held)
+                        or self.checker and id(held) in named_only
                         or self.checker and is_system(value.__name__) and is_constant(held)):
                     break
                 target, value, label = parents[id(target)], held, attribute
@@ -1089,17 +1222,27 @@ class Package:
 
     def stand_in(self, home, preferred, value, user, module_name, attribute):
         # what a model names of a module the models stand in for, but doesn't model: an empty class or an object
-        # in its compiled module, as no model makes one, nor needs more than its name
+        # in its compiled module, as no model makes one, nor needs more than its name; or an exception class the
+        # models raise as it is, with the original's bases, which stands in for it in the tables too, so that the
+        # program catches what the models raise
         if not isinstance(value, type) and callable(value):
             raise UncompilableModel(
                 f"{user} calls {module_name}.{attribute}, which the models stand in for but don't model"
             )
         if id(value) not in self.placed:
             self.place(value, module_name, attribute, user)
-            self.module(module_name).blocks.append(
-                f"class {attribute}:\n    # named only: no model makes one\n    pass" if isinstance(value, type)
-                else f"{attribute} = object()  # named only: the models compare against it"
-            )
+            if isinstance(value, type) and issubclass(value, BaseException):
+                bases = ", ".join(base.__name__ if getattr(builtins, base.__name__, None) is base
+                                  else self.local_name(module_name, base.__name__, base, user, module_name)
+                                  for base in value.__bases__)
+                block = (f"class {attribute}({bases}):\n    # stands in for {module_name}.{attribute}, which the "
+                         f"models raise as it is\n    __module__ = {module_name!r}")
+                self.replace(value, module_name, attribute)
+            elif isinstance(value, type):
+                block = f"class {attribute}:\n    # named only: no model makes one\n    pass"
+            else:
+                block = f"{attribute} = object()  # named only: the models compare against it"
+            self.module(module_name).blocks.append(block)
         return self.local_name(home, preferred, value, user, module_name)
 
     def written_out(self, home, preferred, value, user, owner):
@@ -1171,14 +1314,15 @@ class Package:
 
     def standing_in(self):
         # the modules the compiled ones stand in for as a whole: those the models stand in for that aren't the
-        # standard library's, for a model checker
+        # standard library's, for a model checker, and the packages above them
         if not self.checker:
             return []
-        return [(name, name) for name in sorted(self.modelled) if not is_standard(name)]
+        whole = {above for name in self.modelled if not is_standard(name) for above in with_packages(name)}
+        return [(name, name) for name in sorted(whole)]
 
     def reexport(self):
         # a module standing in for another keeps the names it has for what's compiled in other modules
-        for name, _ in self.standing_in():
+        for name in sorted(name for name, _ in self.standing_in() if name in self.modelled):
             original = sys.modules.get(name)
             for attribute, value in sorted(vars(original).items()) if original else []:
                 if attribute.startswith("__") or attribute in self.modules[name].names:
@@ -1186,10 +1330,60 @@ class Package:
                 if id(value) in self.placed and self.placed[id(value)][0] != name:
                     self.local_name(name, attribute, value, name, name)
 
+    def write_constants(self):
+        # a compiled module of a C module has its constants too, as the C module has them, so that it can stand in
+        # for the whole module in a Python without it
+        if not self.checker:
+            return
+        for name, module in sorted(self.modules.items()):
+            spec = spec_of(name) if is_standard(name) and name != "builtins" else None
+            if spec is None or not is_c_spec(spec):
+                continue
+            constants = [(key, value) for key, value in vars(importlib.import_module(name)).items()
+                         if not key.startswith("__") and key not in module.names and is_constant(value)]
+            for key, value in constants:
+                module.names[key] = value
+            if constants:
+                module.blocks.append(f"# the constants of {name}\n" + "\n".join(f"{key} = {value!r}" for key, value in constants))
+
+    def rows(self):
+        # REPLACED: for each original, the row of its own name in its home, then one for every other name a
+        # standard library module binds it to, of those loaded as it compiles, which are the modules the models and
+        # their originals import; a module the package compiles gets its other names for it too, so that its rows
+        # name the model as they name the original
+        holders = {}
+        for holder, module in sorted(list(sys.modules.items())):
+            if module is not None and is_standard(holder) and holder != "__main__":
+                for key, value in list(vars(module).items()):
+                    holders.setdefault(id(value), []).append((holder, key))
+        rows = []
+        for original, home, local in self.replaced:
+            names = [key for key, value in vars(sys.modules[home]).items() if value is original]
+            # its own name there, else another it has there, else its own when something else stands there now,
+            # as in a test's patch
+            own = original.__name__ if original.__name__ in names or not names else names[0]
+            rows.append((home, own, home, local))
+            compiled = self.module(home)
+            for holder, key in holders.get(id(original), []):
+                if (holder, key) == (home, own):
+                    continue
+                if holder == home and compiled.names.get(key, original) is original:
+                    if key not in compiled.names:
+                        compiled.names[key] = original
+                        compiled.blocks.append(f"{key} = {local}")
+                    rows.append((home, key, home, key))
+                else:
+                    rows.append((holder, key, home, local))
+        return rows
+
     def files(self):
         while self.pending:
             self.write_pending(self.objects[next(iter(self.pending))])
         self.reexport()
+        self.write_constants()
+        relative = lambda name: "." + name
+        rows = [(module, name, relative(home), local) for module, name, home, local in self.rows()]
+        standing_in = [(module, relative(home)) for module, home in self.standing_in()]
         packages = self.packages()
         header = COMPILED_HEADERS[self.compilation]
         files = {}
@@ -1198,13 +1392,25 @@ class Package:
             files[module_file(name, packages)] = "\n".join(parts) + "\n"
         for name in sorted(packages - set(self.modules)):
             files[module_file(name, packages)] = PACKAGE_INIT
-        relative = lambda name: "." + name
-        tables = TABLES.format(
-            replaced=pretty([(module, name, relative(home), local) for module, name, home, local in self.replaced]),
-            standing_in=pretty([(module, relative(home)) for module, home in self.standing_in()]),
-        )
-        files["__init__.py"] = CHECKER_INIT.format(tables=tables) if self.checker else \
-            INSTALLER.format(tables=tables, install=inspect.getsource(install))
+        if self.pure:
+            lines = [f"#   {module}.{name} -> {home}.{local}" for module, name, home, local in rows]
+            lines += [f"#   {module} -> {home}, whole" for module, home in standing_in]
+            files["__init__.py"] = PURE_INIT.format(lines="\n".join(lines) or "#   (nothing)")
+            for path, source in files.items():
+                try:
+                    compile(source, path, "exec")
+                except SyntaxError as error:
+                    raise UncompilableModel(f"the compiled {path} isn't Python: {error}") from None
+        else:
+            files["__init__.py"] = PACKAGE_TABLES.format(
+                placing=PLACING[self.compilation], replaced=pretty(rows), standing_in=pretty(standing_in))
+        if self.no_c_spec and (needed := c_specs_needed(files)):
+            raise UncompilableModel(
+                "with no C specs, the package can need no C module but those Python's own semantics rest on, and it "
+                "needs " + "; ".join(f"{chain[-1]}, as {chain[0]} imports {', which imports '.join(chain[1:])}"
+                                     for chain in needed)
+                + ". Model what the models need of them, or reach it through models"
+            )
         return files
 
 def defining_module(value):
@@ -1262,10 +1468,12 @@ def assignment_of(value, owner, is_model_code):
                     return module.__name__, statement, ast.get_source_segment(source, statement), bound
     return None
 
-def compile_models(models, compilation):
+def compile_models(models, compilation, *, no_c_spec=False, pure=False):
     # the package the models compile to, {path: source}: a module for each module the models stand in for, with
-    # each model under its original's name, and an __init__.py that installs them in place of the originals
-    package = Package(compilation)
+    # each model under its original's name, and an __init__.py with the tables of what they stand in for. With no
+    # C specs, it may need no C module of the standard library but those Python's semantics rest on; pure, it also
+    # runs in pure Python, and its __init__.py names the real modules in comments alone
+    package = Package(compilation, no_c_spec, pure)
     for kind, entry in get_models(models):
         package.add(kind, entry)
     return package.files()

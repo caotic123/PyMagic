@@ -8,10 +8,9 @@
 # (the copies are from httplib2 0.32, MIT license, Copyright 2006 Joe Gregorio)
 
 import copy
-import hmac
 import time
-import base64
 import random
+import binascii
 import string
 import zlib
 import hashlib
@@ -233,10 +232,32 @@ def _cnonce():
     return dig[:16]
 
 
+# base64.b64encode(), as base64 does it with binascii: base64 needs C modules (binascii, _struct) that a pure Python
+# has no models of
 def _wsse_username_token(cnonce, iso_now, password):
     return (
-        base64.b64encode(_sha(("%s%s%s" % (cnonce, iso_now, password)).encode("utf-8")).digest()).strip().decode("utf-8")
+        binascii.b2a_base64(_sha(("%s%s%s" % (cnonce, iso_now, password)).encode("utf-8")).digest(), newline=False)
+        .strip().decode("utf-8")
     )
+
+
+# hmac.new(key, msg, digestmod).hexdigest(), as hmac does it over a hash constructor (RFC 2104): hmac needs the C
+# module _hashlib whole, which the models stand in for with its hashes alone
+TRANS_5C = bytes(x ^ 0x5C for x in range(256))
+TRANS_36 = bytes(x ^ 0x36 for x in range(256))
+
+def hmac_hexdigest(key, msg, digestmod):
+    if not isinstance(key, (bytes, bytearray)):
+        raise TypeError("key: expected bytes or bytearray, but got %r" % type(key).__name__)
+    outer, inner = digestmod(), digestmod()
+    if len(key) > inner.block_size:
+        key = digestmod(key).digest()
+    key = key.ljust(inner.block_size, b"\0")
+    outer.update(key.translate(TRANS_5C))
+    inner.update(key.translate(TRANS_36))
+    inner.update(msg)
+    outer.update(inner.digest())
+    return outer.hexdigest()
 
 
 @model(httplib2.Authentication)
@@ -302,8 +323,8 @@ class BasicAuthentication(Authentication):
     def request(self, method, request_uri, headers, content):
         """Modify the request headers to add the appropriate
         Authorization header."""
-        headers["authorization"] = "Basic " + base64.b64encode(
-            ("%s:%s" % self.credentials).encode("utf-8")
+        headers["authorization"] = "Basic " + binascii.b2a_base64(
+            ("%s:%s" % self.credentials).encode("utf-8"), newline=False
         ).strip().decode("utf-8")
 
 
@@ -435,7 +456,7 @@ class HmacDigestAuthentication(Authentication):
         created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         cnonce = _cnonce()
         request_digest = "%s:%s:%s:%s:%s" % (method, request_uri, cnonce, self.challenge["snonce"], headers_val,)
-        request_digest = hmac.new(self.key, request_digest, self.hashmod).hexdigest().lower()
+        request_digest = hmac_hexdigest(self.key, request_digest, self.hashmod).lower()
         headers["authorization"] = (
             'HMACDigest username="%s", realm="%s", snonce="%s",'
             ' cnonce="%s", uri="%s", created="%s", '

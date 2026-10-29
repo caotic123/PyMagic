@@ -223,10 +223,8 @@ A model compiles to a package of Python modules: one for each module the models 
 `__init__.py` that says which original each model stands in for. Compiled for a model checker, `magic()` is left
 for the checker to supply, and constraints become asserts that fail with a `BrokenVariant`. The package imports
 nothing of the system a checker can't run, like `sys`, `os` or `socket`: what the models read of it, like
-`sys.byteorder`, is written in as a literal, and a model that calls into it doesn't compile. Its `__init__.py`
-runs nothing either: putting the models in place of the originals is the checker's job, or, in Python,
-`install(package)`'s. Compiled concretely, the package installs itself when imported. With the dice game saved
-as `dice.py`:
+`sys.byteorder`, is written in as a literal, and a model that calls into it doesn't compile. With the dice game
+saved as `dice.py`:
 
 ```bash
 python3.10 -m PyMagic compile dice:randint -o out/compiled
@@ -247,18 +245,43 @@ def randint(a, b):
     return face
 ```
 
-Running the compiled model with `magic()` supplied, as a model checker would supply it:
+Nothing in the package puts the models in place: its `__init__.py` runs nothing and imports nothing, and only
+has two tables, which whoever runs the package places the models by, and by nothing else:
 
 ```python
-import sys, builtins
-from PyMagic import install
+# (real module, the original's name there, compiled module, the model's name there)
+REPLACED = [
+    ('random', 'randint', '.random', 'randint'),
+]
+
+# (real module, compiled module)
+STANDING_IN = []
+```
+
+- A compiled module is named relative to the package, and stands in for the real module of its name.
+- `REPLACED` has a row for every name a standard library module binds an original to: the original's own name in
+  its own module first, then its aliases, like `hashlib.md5` for `_hashlib.openssl_md5`, in the modules loaded
+  while compiling, which are those the models and their originals import. The rows of a real
+  module the package compiles name the model as they name the original: where the compiled `_socket` binds
+  `socket`, it binds `SocketType` too.
+- Compiled for a model checker, a compiled module of a C module also has the C module's constants, so that where
+  there is no such C module, the compiled one stands in for it whole. A concrete package calls the real modules,
+  which stay.
+- A module in `STANDING_IN`, like `httplib2`, is stood in for whole, and so is every package above it.
+
+Running the compiled model with `magic()` supplied, placed as a model checker would place it:
+
+```python
+import sys, builtins, importlib
 sys.path.insert(0, "out")
 
 landing = iter([3, 3, 9, 2])
 builtins.magic = lambda *kinds: next(landing)   # what a model checker supplies
 
-install("compiled")                             # random.randint is the compiled model now
-from dice import play
+import random, compiled
+for module, name, home, local in compiled.REPLACED:
+    setattr(sys.modules[module], name, getattr(importlib.import_module(home, "compiled"), local))
+from dice import play                           # random.randint is the compiled model now
 
 play()    # 'doubles: you win a pizza'
 play()    # AssertionError: the values broke a <= face <= b: ... (its message is a BrokenVariant)
@@ -270,13 +293,43 @@ The whole httplib2 model compiles the same way, into 17 modules that need neithe
 python3.10 -m PyMagic compile http_model -o out/compiled
 ```
 
+### No C specs, and pure Python
+
+The standard library modules a compiled package imports may need C modules, which a model checker running Python
+in Python doesn't have. `--no-C-spec` refuses a package that needs one, through any module it imports as that
+module runs, and says by which imports it does:
+
+```
+PyMagic: with no C specs, the package can need no C module but those Python's own semantics rest on, and it needs
+binascii, as httplib2/__init__.py imports base64, which imports binascii; ...
+```
+
+The C modules Python's own semantics rest on are allowed: `builtins`, `sys`, `_imp`, `marshal`, `_io`,
+`_thread`, `_weakref`, `_warnings`, `_abc`, `_codecs`, `_string`, `_sre`, `itertools`, `_collections`,
+`_functools` and `_operator`. An import a module goes on without, in a `try` that catches the `ImportError`, as
+`heapq` goes on without `_heapq`, isn't needed; nor are those of functions, or of `if __name__ == "__main__":`.
+
+`--pure` goes further, for a package that runs in pure Python: it has no C specs, every module is checked to
+compile, and its `__init__.py` has no tables, only comments naming the real modules:
+
+```python
+# compiled from PyMagic models to run in pure Python, needing no C module but those Python's own semantics rest
+# on. Nothing here runs: each compiled module stands in for the real module of its name, and holds the models of
+# these real objects, under the names after the arrows
+#
+#   random.randint -> .random.randint
+```
+
+The httplib2 model compiles pure: the models reach base64 and HMAC through the `binascii` and `_hashlib` models,
+not through `base64` and `hmac`, which need C.
+
 From Python, `compile_models(models, Compilation.MODEL_CHECKER)` returns the package as `{path: source}`, and
-`write_package(files, directory)` writes it.
+`write_package(files, directory)` writes it; `no_c_spec=True` and `pure=True` are the flags.
 
 # Command line
 
 ```
-pymagic compile MODELS [-o DIRECTORY] [--concrete] [--force]
+pymagic compile MODELS [-o DIRECTORY] [--concrete] [--no-C-spec] [--pure] [--force]
 ```
 
 `pymagic` is installed with the package; `python3.10 -m PyMagic` does the same.
@@ -287,13 +340,16 @@ pymagic compile MODELS [-o DIRECTORY] [--concrete] [--force]
   isn't empty is written into only with `--force`, which overwrites the files it writes and keeps the others.
 - `--concrete` compiles the models to call the real effects in place of `magic()`, checking each result against
   the model, instead of compiling them for a model checker.
+- `--no-C-spec` refuses a package that needs a C module, but those Python's own semantics rest on.
+- `--pure` compiles a package to run in pure Python: it has no C specs, and its `__init__.py` names the real
+  modules in comments alone.
 - If the models can't be compiled, the reason is printed and the exit code is 1. If they can't be found, the exit
   code is 2. `python3.10 -m PyMagic compile --help` shows this too.
 
 # What's here
 
 - `PyMagic/`: the library. `model.py` has `@model`, `magic()` and `constraint()`; `run.py` has `run_model`;
-  `compile.py` has `compile_models` and `install`; `cli.py` has the command line.
+  `compile.py` has `compile_models`; `cli.py` has the command line.
 - `http_model/`: a model of httplib2, laid out as httplib2 is.
 - `stdlib_model/`: models of the standard library modules the httplib2 model reaches, and of sockets, a folder
   for each. `stdlib_model/magics.py` has the magics that answer them: a clock, a seeded random generator, and a

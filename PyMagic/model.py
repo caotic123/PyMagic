@@ -70,9 +70,10 @@ def signature_of(original):
 named_only = {}
 
 def named(original):
-    # marks an object the models only name, as an identity or a class for isinstance(), as no model makes one:
-    # in a run it is the original, and compiled for a model checker it is a stand-in for it, an empty class or an
-    # object(), so the compiled models don't import the module it comes from
+    # marks an object the models only name: an identity, a class for isinstance(), or an exception they raise as
+    # it is. In a run it is the original, and compiled for a model checker it is a stand-in for it, an object(), an
+    # empty class or an exception class with the original's bases, so the compiled models don't import the module
+    # it comes from
     named_only[id(original)] = original
     return original
 

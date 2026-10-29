@@ -1,8 +1,12 @@
 import os
 import ast
 import sys
-import inspect
+import math
+import heapq
+import base64
 import random
+import importlib
+import py_compile
 import builtins
 import itertools
 from random import randint
@@ -11,11 +15,10 @@ from unittest import mock
 import pytest
 
 import PyMagic
-from PyMagic.compile import PACKAGE_INIT, write_package
+from PyMagic.compile import PACKAGE_INIT, PLACING, c_specs_needed
 from PyMagic import (
     BrokenVariant, MissedModelObject, RunningUnstatedModel, UncompilableModel,
-    Compilation, Model, collect_magic, compile_models, constraint, get_models, install, magic, model, named,
-    run_model,
+    Compilation, Model, collect_magic, compile_models, constraint, get_models, magic, model, named, run_model,
 )
 from effecful import magics, magics_by_name, models, simple, _model_Random
 
@@ -853,7 +856,7 @@ class BrokenVariant(BaseException):
 """
 
 def compiled(models, compilation, module=None):
-    # the source of the module the models compile to, or of the one standing in for module; the installer and
+    # the source of the module the models compile to, or of the one standing in for module; the tables and
     # _pymagic.py, with what models use of PyMagic, aren't theirs
     files = {path: source for path, source in compile_models(models, compilation).items()
              if path not in ("__init__.py", "_pymagic.py") and source != PACKAGE_INIT}
@@ -1102,29 +1105,79 @@ def test_compile_copies_under_their_originals_names():
     assert "raise Refused(f'{question} no', 403) from KeyError(question)" in checker
 
 
-def installed(files, tmp_path, script, before="", installing="install('compiled')\n"):
-    # what a script prints in a Python that runs before, then installs the compiled package, with magic() drawing 4
-    import subprocess
-    write_package(files, tmp_path / "compiled")
-    preamble = f"{inspect.getsource(install)}\nimport builtins\nbuiltins.magic = lambda *kinds: 4\n{before}{installing}"
-    run = subprocess.run([sys.executable, "-c", preamble + script], cwd=tmp_path, capture_output=True, text=True)
-    assert run.returncode == 0, run.stderr
-    return run.stdout.split()
-
-
-def test_installing_the_package_puts_the_models_in_place_of_the_originals(tmp_path):
+def test_placing_the_package_puts_the_models_in_place_of_the_originals(run_package):
     files = compile_models(models, Compilation.MODEL_CHECKER)
-    # randint was imported from random before installing, and is the model too
-    script = "print(random.randint.__module__, randint.__module__, builtins.input.__module__, randint(1, 6))"
-    assert installed(files, tmp_path, script, before="import random\nfrom random import randint\n") == \
-        ["compiled.random", "compiled.random", "compiled.builtins", "4"]
+    # builtins was loaded before, random is once it has run
+    script = ("import builtins\nbuiltins.magic = lambda *kinds: 4\nimport random\nfrom random import randint\n"
+              "print(random.randint.__module__, randint.__module__, builtins.input.__module__, randint(1, 6))")
+    assert run_package(files, script).split() == ["compiled.random", "compiled.random", "compiled.builtins", "4"]
 
 
-def test_a_package_for_a_model_checker_says_what_it_stands_in_for_and_runs_nothing():
-    init = compile_models(models, Compilation.MODEL_CHECKER)["__init__.py"]
-    assert absolute_imports(init) == []
-    assert [type(statement) for statement in ast.parse(init).body] == [ast.Assign, ast.Assign]
-    assert "    ('random', 'randint', '.random', 'randint'),\n" in init
+def test_a_package_says_what_its_models_stand_in_for_and_runs_nothing():
+    for compilation in Compilation:
+        init = compile_models(models, compilation)["__init__.py"]
+        assert absolute_imports(init) == []
+        assert [type(statement) for statement in ast.parse(init).body] == [ast.Assign, ast.Assign]
+        assert "    ('random', 'randint', '.random', 'randint'),\n" in init and PLACING[compilation] in init
+
+
+def test_a_pure_package_names_the_real_modules_in_comments_alone(run_package):
+    files = compile_models(models, Compilation.MODEL_CHECKER, pure=True)
+    assert ast.parse(files["__init__.py"]).body == []
+    assert "#   random.randint -> .random.randint\n" in files["__init__.py"]
+    assert {path: source for path, source in files.items() if path != "__init__.py"} == \
+        {path: source for path, source in compile_models(models, Compilation.MODEL_CHECKER).items() if path != "__init__.py"}
+    script = "import builtins\nbuiltins.magic = lambda *kinds: 4\nfrom compiled.random import randint\nprint(randint(1, 6))"
+    assert run_package(files, script, pure=True).split() == ["4"]
+
+
+def encoded(data):
+    return base64.b64encode(data)
+
+
+@model(encoded)
+def model_encoded(data):
+    text = magic(bytes)
+    constraint(text == base64.b64encode(data))
+    return text
+
+
+def smallest(numbers):
+    return min(numbers)
+
+
+@model(smallest)
+def model_smallest(numbers):
+    least = magic(int)
+    constraint([least] == heapq.nsmallest(1, numbers))
+    return least
+
+
+def rounded(number):
+    return round(number)
+
+
+@model(rounded)
+def model_rounded(number):
+    whole = magic(int)
+    constraint(math.floor(number) <= whole <= math.ceil(number))
+    return whole
+
+
+def test_with_no_c_specs_a_package_needs_no_c_module_but_pythons_own():
+    # base64 needs binascii and _struct, written in C
+    assert "\nimport base64\n" in compiled([model_encoded], Compilation.MODEL_CHECKER)
+    for flags in [{"no_c_spec": True}, {"pure": True}]:
+        with pytest.raises(UncompilableModel, match=r"needs binascii, as test_effecful.py imports base64, which "
+                                                    r"imports binascii; _struct, as test_effecful.py imports base64, "
+                                                    r"which imports struct, which imports _struct\. "):
+            compile_models([model_encoded], Compilation.MODEL_CHECKER, **flags)
+    # heapq goes on without _heapq, in pure Python
+    assert "\nimport heapq\n" in compiled([model_smallest], Compilation.MODEL_CHECKER)
+    compile_models([model_smallest], Compilation.MODEL_CHECKER, no_c_spec=True)
+    # the models' own imports of C modules too
+    with pytest.raises(UncompilableModel, match=r"needs math, as test_effecful.py imports math\. "):
+        compile_models([model_rounded], Compilation.MODEL_CHECKER, no_c_spec=True)
 
 
 def byte_order():
@@ -1159,11 +1212,10 @@ def test_compile_for_a_model_checker_writes_the_systems_constants_and_imports_no
     assert "import os" in compiled([model_parent_id], Compilation.CONCRETE)
 
 
-def test_installing_a_concrete_package_keeps_the_real_effects_it_calls(tmp_path):
+def test_placing_a_concrete_package_keeps_the_real_effects_it_calls(run_package):
     files = compile_models(models, Compilation.CONCRETE)
     script = "import random\nprint(random.randint.__module__, all(1 <= random.randint(1, 6) <= 6 for _ in range(20)))"
-    # importing it installs it
-    assert installed(files, tmp_path, script, installing="import compiled\n") == ["compiled.random", "True"]
+    assert run_package(files, script, concrete=True).split() == ["compiled.random", "True"]
 
 
 class Ticket:
@@ -1467,6 +1519,30 @@ def test_command_line_writes_the_package(tmp_path, capsys):
     assert "isn't empty; use --force" in capsys.readouterr().err
     assert command_line(["compile", "effecful", "-o", str(output), "--force"]) == 0
     assert (output / "random.py").read_text() == compile_models(models, Compilation.MODEL_CHECKER)["random.py"]
+
+
+def test_no_c_specs_follows_what_a_module_may_import_as_it_runs(tmp_path, monkeypatch):
+    # a try that goes on without json may import math in its else; a handler may run, without C modules;
+    # zipimport is frozen, and read from its source in the library; a relative import out of no package fails
+    (tmp_path / "going_on.py").write_text("try:\n    import json\nexcept ImportError:\n    pass\nelse:\n    import math\n")
+    (tmp_path / "handling.py").write_text("try:\n    number = int('4')\nexcept ValueError:\n    import array\n")
+    (tmp_path / "relative.py").write_text("from . import nothing\n")
+    (tmp_path / "unread.py").write_text("import math\n")
+    py_compile.compile(str(tmp_path / "unread.py"), cfile=str(tmp_path / "sourceless.pyc"))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    assert c_specs_needed({"m.py": "import going_on, handling, relative, zipimport\n"}) == \
+        [["m.py", "going_on", "math"], ["m.py", "handling", "array"], ["m.py", "zipimport", "time"]]
+    with pytest.raises(UncompilableModel, match="read from its source, and sourceless has none, as m.py imports sourceless"):
+        c_specs_needed({"m.py": "import sourceless\n"})
+
+
+def test_command_line_compiles_with_no_c_specs_and_pure(capsys):
+    assert command_line(["compile", "test_effecful:model_encoded", "--no-C-spec"]) == 1
+    assert capsys.readouterr().err.startswith("PyMagic: with no C specs, the package can need no C module but those "
+                                              "Python's own semantics rest on, and it needs binascii, as ")
+    assert command_line(["compile", "effecful", "--pure"]) == 0
+    assert "#   random.randint -> .random.randint\n" in capsys.readouterr().out
 
 
 def test_command_line_reports_what_it_cannot_compile(capsys):

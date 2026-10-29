@@ -126,3 +126,14 @@ def test_refuses_as_zlib(call):
 def test_max_length_is_not_modelled():
     with pytest.raises(RunningUnstatedModel, match="max_length"):
         modelled(lambda: zlib.decompressobj().decompress(zlib.compress(b"x" * 100), 10))
+
+def test_what_zlib_raises_where_it_isnt_modelled_is_its_error():
+    # the model raises zlib.error as it is, so that it's the class zlib's other functions raise too
+    def decompressed(data):
+        try:
+            return zlib.decompress(data)
+        except zlib.error as error:
+            return "caught", str(error)
+    for data in [b"bad", zlib.compress(b"fine")]:
+        assert modelled(lambda: decompressed(data)) == outcome(lambda: decompressed(data))
+    assert outcome(lambda: decompressed(b"bad"))[1][0] == "caught"

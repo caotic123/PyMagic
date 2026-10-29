@@ -1,7 +1,12 @@
 import ast
 import sys
 import gzip
+import hmac
 import json
+import time
+import zlib
+import _socket
+import hashlib
 import random
 import inspect
 import pathlib
@@ -22,7 +27,7 @@ import pytest
 from PyMagic import BrokenVariant, Model, RunningUnstatedModel, get_models, run_model
 from PyMagic.model import model_members
 import httplib2.auth
-from http_model import _model_httplib2, auth, models
+from http_model import _model_httplib2, auth, hmac_hexdigest, models
 from http_model.decode import ZlibDecoder, raw_deflate
 from http_model.magics import as_model_proxy, magics, module_magics, real, reply
 from stdlib_model.magics import stdlib_magics
@@ -707,11 +712,13 @@ def test_requests_run_none_of_the_libraries_modelled(routes, request_):
 
 # ------------------------------------------------------------------ compiled for a model checker
 
-from PyMagic import Compilation, compile_models, install
-from PyMagic.compile import SYSTEM_MODULES, write_package
+from PyMagic import Compilation, compile_models
+from PyMagic.compile import SYSTEM_MODULES, bound_here, is_constant, is_standard, with_packages
 
-RUN_COMPILED = """\
-import sys, json, builtins, importlib.abc
+# six requests to a compiled httplib2, run without httplib2 or PyMagic: REACHING says how the script reaches
+# httplib2 and gaierror, the compiled ones
+REQUESTS = """\
+import sys, builtins, importlib.abc
 
 class Refuse(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path=None, target=None):
@@ -721,9 +728,7 @@ sys.meta_path.insert(0, Refuse())
 
 values = []
 builtins.magic = lambda *kinds: values.pop(0)
-install("compiled")
-import gzip, socket
-import httplib2
+REACHING
 
 def run(draws, call):
     values[:] = [None] * 8 + draws  # Http() reads its four decode limits from the environment, two variables each
@@ -737,15 +742,29 @@ for draws, call in [
     (json_reply, lambda: httplib2.Http().request("http://api.test/user")[1]),
     ([None, 302, "Found", 11, {"Location": "/user"}, b""] + json_reply,
      lambda: (lambda response: (response.status, response.previous.status))(httplib2.Http().request("http://api.test/old")[0])),
-    ([socket.gaierror(-2, "Name or service not known")], lambda: httplib2.Http().request("http://api.test/")),
+    ([gaierror(-2, "Name or service not known")], lambda: httplib2.Http().request("http://api.test/")),
     ([None, 42, "?", 11, {}, b""], lambda: httplib2.Http().request("http://api.test/")),
     ([], lambda: httplib2.Http().request("/relative")),
-    ([None, 200, "OK", 11, {"Content-Encoding": "gzip"}, gzip.compress(b"squeezed")],
+    ([None, 200, "OK", 11, {"Content-Encoding": "gzip"}, SQUEEZED],
      lambda: httplib2.Http().request("http://api.test/z")[1]),
 ]:
     print(run(draws, call))
 print([name for name in ("PyMagic", "http_model", "stdlib_model", "pyparsing") if name in sys.modules])
 """
+
+ANSWERS = [
+    "b'{\"name\": \"lol\"}'",
+    "(200, 302)",
+    "ServerNotFoundError: Unable to find the server at api.test",
+    "AssertionError: the values broke 101 <= status <= 999: the model of request rejected this call",
+    "RelativeURIError: Only absolute URIs are allowed. uri = /relative",
+    "b'squeezed'",
+    "[]",
+]
+
+def requests(reaching):
+    # the script of the six requests, with a gzipped body made here, as zlib may be the compiled one there
+    return f"SQUEEZED = {gzip.compress(b'squeezed', mtime=0)!r}\n" + REQUESTS.replace("REACHING", reaching)
 
 def test_whole_model_compiles_to_a_package_that_names_no_model_or_library():
     files = compile_models(models, Compilation.MODEL_CHECKER)
@@ -764,19 +783,66 @@ def test_whole_model_compiles_to_a_package_that_names_no_model_or_library():
         assert "__model__" not in source and "@model" not in source, path
     assert [path for path, source in files.items() if "class BrokenVariant" in source] == ["_pymagic.py"]
 
-def test_whole_model_runs_compiled_without_httplib2_or_pymagic(tmp_path):
-    import subprocess
-    write_package(compile_models(models, Compilation.MODEL_CHECKER), tmp_path / "compiled")
-    # installed as a model checker's harness would, without PyMagic
-    script = inspect.getsource(install) + RUN_COMPILED
-    run = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, capture_output=True, text=True)
-    assert run.returncode == 0, run.stderr
-    assert run.stdout.splitlines() == [
-        "b'{\"name\": \"lol\"}'",
-        "(200, 302)",
-        "ServerNotFoundError: Unable to find the server at api.test",
-        "AssertionError: the values broke 101 <= status <= 999: the model of request rejected this call",
-        "RelativeURIError: Only absolute URIs are allowed. uri = /relative",
-        "b'squeezed'",
-        "[]",
+def test_whole_model_runs_compiled_where_its_tables_place_it(run_package):
+    files = compile_models(models, Compilation.MODEL_CHECKER)
+    # httplib2 is the compiled one, and so is the whole of _socket, a C module the package compiles
+    assert run_package(files, requests("import httplib2\nfrom _socket import gaierror")).splitlines() == ANSWERS
+    # the whole of zlib and binascii too, with what gzip and base64 need of them, and binascii.Error is the one
+    # the compiled binascii raises
+    script = ("import gzip, base64, binascii\nprint(gzip.zlib.__name__, gzip.zlib.Z_SYNC_FLUSH, base64.b64decode(b'aGk='))\n"
+              "try:\n    base64.b64decode(b'a')\nexcept binascii.Error as error:\n    print(type(error).__qualname__, error)")
+    assert run_package(files, script).splitlines() == [
+        f"compiled.zlib {zlib.Z_SYNC_FLUSH} b'hi'",
+        "Error Invalid base64-encoded string: number of data characters (1) cannot be 1 more than a multiple of 4",
     ]
+
+def test_whole_model_compiles_pure_and_runs_in_pure_python(run_package):
+    files = compile_models(models, Compilation.MODEL_CHECKER, pure=True)
+    reaching = "from compiled import httplib2\nfrom compiled._socket import gaierror"
+    assert run_package(files, requests(reaching), pure=True).splitlines() == ANSWERS
+
+def top_level_names(source):
+    # the names a module binds at its top level
+    return {name for statement in ast.parse(source).body for name in bound_here([statement])}
+
+def test_the_tables_say_where_each_model_goes():
+    files = compile_models(models, Compilation.MODEL_CHECKER)
+    tables = {statement.targets[0].id: ast.literal_eval(statement.value) for statement in ast.parse(files["__init__.py"]).body}
+    replaced, standing_in = tables["REPLACED"], tables["STANDING_IN"]
+    homes = {path.removesuffix(".py").removesuffix("/__init__").replace("/", "."): source for path, source in files.items()}
+    for module, name, home, local in replaced:
+        # each compiled module named relative to the package, with the model; a module it compiles names it as
+        # the original is named there
+        assert home.startswith(".") and local in top_level_names(homes[home[1:]]), (module, name)
+        assert home != "." + module or name == local, (module, name)
+    for module, home in standing_in:
+        assert home == "." + module and all(above in dict(standing_in) for above in with_packages(module))
+    # every name a loaded standard library module binds an original to, its own module's own name first
+    originals = {id(getattr(sys.modules[module], name)): (module, name) for module, name, home, _ in replaced if home == "." + module}
+    bound = {(holder, key) for holder, held in list(sys.modules.items()) if held is not None and is_standard(holder)
+             for key, value in list(vars(held).items()) if id(value) in originals}
+    assert bound <= {(module, name) for module, name, _, _ in replaced} and len(replaced) == len(set(replaced))
+    assert {("_socket", "socket", "._socket", "socket"), ("_socket", "SocketType", "._socket", "SocketType"),
+            ("socket", "SocketType", "._socket", "socket"), ("hashlib", "md5", "._hashlib", "openssl_md5"),
+            ("http.client", "error", ".http.client", "error"), ("sre_parse", "error", ".re", "error")} <= set(replaced)
+    assert "\nSocketType = socket\n" in files["_socket.py"] and "\nerror = HTTPException\n" in files["http/client.py"]
+
+def test_a_compiled_c_module_has_its_constants():
+    files = compile_models(models, Compilation.MODEL_CHECKER)
+    for module, path in [(zlib, "zlib.py"), (_socket, "_socket.py"), (time, "time.py")]:
+        constants = {key: value for key, value in vars(module).items() if not key.startswith("__") and is_constant(value)}
+        namespace = {}
+        exec("\n".join(line for line in files[path].splitlines() if not line.startswith(("from .", "import "))), namespace)
+        assert {key: namespace[key] for key in constants} == constants, path
+
+def test_hmac_digest_is_hmacs():
+    # hmac's, which the model computes itself
+    pick = random.Random(5)
+    for size in [0, 1, 20, 63, 64, 65, 200]:
+        key, message = bytes(pick.randrange(256) for _ in range(size)), bytes(pick.randrange(256) for _ in range(size * 3))
+        for digestmod in (hashlib.md5, hashlib.sha1):
+            assert hmac_hexdigest(key, message, digestmod) == hmac.new(key, message, digestmod).hexdigest()
+            assert hmac_hexdigest(bytearray(key), message, digestmod) == hmac.new(bytearray(key), message, digestmod).hexdigest()
+    for call in (hmac_hexdigest, hmac.new):
+        with pytest.raises(TypeError, match="key: expected bytes or bytearray, but got 'str'"):
+            call("key", b"message", hashlib.md5)

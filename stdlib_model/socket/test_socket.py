@@ -1,17 +1,13 @@
 import errno
 import http.client
-import inspect
 import io
 import random
 import socket
-import subprocess
-import sys
 import _socket
 
 import pytest
 
-from PyMagic import BrokenVariant, Compilation, RunningUnstatedModel, compile_models, install, run_model
-from PyMagic.compile import write_package
+from PyMagic import BrokenVariant, Compilation, RunningUnstatedModel, compile_models, run_model
 from stdlib_model import models, socket as model_socket
 from stdlib_model.magics import network, real_network
 from stdlib_model.testing import modelled, modelled_each, outcome
@@ -422,7 +418,6 @@ COMPILED_TALK = """\
 import builtins, socket
 values = iter([(10**7, 10**7 + 1), 4, b"ping", b"too long"])
 builtins.magic = lambda *kinds: next(values)
-install("compiled")
 first, second = socket.socketpair()
 first.sendall(b"ping")
 print(type(first).accept.__module__, second.recv(4))
@@ -432,9 +427,7 @@ except AssertionError as broken:
     print(type(broken.args[0]).__name__)
 """
 
-def test_compiled_socket_models_run_with_a_supplied_magic(tmp_path):
-    write_package(compile_models(models, Compilation.MODEL_CHECKER), tmp_path / "compiled")
-    script = inspect.getsource(install) + COMPILED_TALK
-    run = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, capture_output=True, text=True)
-    assert run.returncode == 0, run.stderr
-    assert run.stdout.split("\n")[:2] == ["compiled.socket b'ping'", "BrokenVariant"]
+def test_compiled_socket_models_run_with_a_supplied_magic(run_package):
+    # socket over the whole of the compiled _socket, as where there's no _socket
+    output = run_package(compile_models(models, Compilation.MODEL_CHECKER), COMPILED_TALK)
+    assert output.split("\n")[:2] == ["compiled.socket b'ping'", "BrokenVariant"]

@@ -1,20 +1,20 @@
 # the model of zlib: decompressobj(), which zlib does in C, written in plain Python (RFC 1950, 1951 and 1952),
-# and a copy of zlib.error, which stands in for it in a run. The decompressor keeps its input and inflates it
+# raising zlib.error as it is. The decompressor keeps its input and inflates it
 # again from the start as more comes, so what it gives at each call is what zlib gives. Compression, checksums as
 # functions and the one-shot decompress() aren't modelled
 # (the inflating follows Mark Adler's puff.c and zlib's inflate.c, and keeps zlib's error messages)
 
 import zlib
 
-from PyMagic import RunningUnstatedModel, model
+from PyMagic import RunningUnstatedModel, model, named
 
 MAX_WBITS = 15
 DEF_BUF_SIZE = 16384
 
 
-@model(zlib.error)
-class error(Exception):
-    pass
+# zlib.error, which the model raises as it is: in a run it's the original, which the functions it doesn't model
+# raise too, and compiled it's a class that stands in for it
+error = named(zlib.error)
 
 
 def data_error(reason):
@@ -332,9 +332,6 @@ class Decompress:
 
 @model(zlib)
 class _model_zlib:
-    # the copy of its error
-    error = error
-
     @model(zlib.decompressobj)
     def decompressobj(wbits=MAX_WBITS, zdict=b""):
         # a decompressor of raw deflate (wbits -8 to -15), zlib (0, 8 to 15), gzip (16 more) or either (32 more)
