@@ -213,10 +213,21 @@ def formatted(format, tm, zone, gmtoff):
     return "".join(text)
 
 
+MONOTONIC = [0.0]  # the last reading of the monotonic clock
+
+
 @model(time)
 class _model_time:
     # the copy of its struct_time
     struct_time = struct_time
+
+    @model(time.monotonic)
+    def monotonic():
+        # the monotonic clock: magic seconds, never before those of the reading before
+        now = magic(float)
+        constraint(now >= MONOTONIC[0])
+        MONOTONIC[0] = now
+        return now
 
     @model(time.ctime)
     def ctime(seconds=None, /):
