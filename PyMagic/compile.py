@@ -51,6 +51,9 @@ COMPILER_NAMES = {
     "SpecPropertyInvalid": SpecPropertyInvalid,
 }
 
+# the name the compiled code of a pure package gives a constraint's condition
+HOLDS = "_holds"
+
 # names the compiled code of a spec gives a need()'s condition, and the ConditionalPropertyRaise of another spec
 SPEC_NAMES = {"_met", "_unmet"}
 
@@ -498,8 +501,19 @@ class ModelCompiler(ast.NodeTransformer):
             )
         condition = statement.value.args[0]
         flag = self.flag(f"the values broke {ast.unparse(condition)}")
+        if self.raises and self.compilation is Compilation.MODEL_CHECKER:
+            return self.holding(self.visit(condition), flag)
         # the condition alone is visited: concretely, the raise of a check isn't the model's own
         return self.check(self.visit(condition), flag)
+
+    def holding(self, condition, flag):
+        # a constraint of a pure package: values the condition can't even be asked of break it, as those it is false
+        # of do. A checker's magic() is any object at all, one without the attribute the condition reads too, so
+        # `_holds` is the condition, or False when asking it raises an Exception; a BrokenVariant goes through
+        holds = lambda value: ast.Assign([ast.Name(HOLDS, ast.Store())], value)
+        asked = ast.IfExp(condition, ast.Constant(True), ast.Constant(False))
+        unasked = ast.ExceptHandler(ast.Name("Exception", ast.Load()), None, [holds(ast.Constant(False))])
+        return [ast.Try([holds(asked)], [unasked], [], []), raise_unless(ast.Name(HOLDS, ast.Load()), flag)]
 
     def kind_check(self, name, kinds):
         # magic(kinds)'s check of its value, as an assert
@@ -579,6 +593,11 @@ def compile_function(func, original, compilation, raises=False):
     node.decorator_list = []
     node.name = original.__name__
     if compilation is Compilation.MODEL_CHECKER:
+        used = {name for code in code_objects(func.__code__) for name in code.co_varnames + code.co_names}
+        if raises and HOLDS in used:
+            raise UncompilableModel(
+                f"{func.__qualname__} uses {HOLDS}, which the compiled code of a constraint needs; rename it"
+            )
         node.body = ModelCompiler(func, node.name, compilation, raises=raises).compile(node.body)
         return node, set(), None
     return compile_concrete(func, original, node, raises)

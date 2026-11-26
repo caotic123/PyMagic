@@ -446,10 +446,18 @@ def randint(a, b):
     face = magic(int)
     if not isinstance(face, int):
         raise BrokenVariant(f'face = magic(int) drew {face!r}, which is not int: the model of randint rejected this call')
-    if not a <= face <= b:
+    try:
+        _holds = True if a <= face <= b else False
+    except Exception:
+        _holds = False
+    if not _holds:
         raise BrokenVariant('the values broke a <= face <= b: the model of randint rejected this call')
     return face
 ```
+
+A checker's `magic()` is any object at all, so a condition may not even be askable of it: `account.balance >= 0`
+of an object with no `balance` raises an `AttributeError`. Such values break the constraint, as those it is false
+of do: an `Exception` raised while asking the condition is a `BrokenVariant`.
 
 The httplib2 model compiles pure: the models reach base64 and HMAC through the `binascii` and `_hashlib` models,
 not through `base64` and `hmac`, which need C.

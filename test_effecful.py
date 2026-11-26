@@ -1133,7 +1133,8 @@ def raised_unless_kind(name, kinds, function):
 
 def raised_unless(condition, function):
     # the raise of a broken constraint(condition), in a pure package
-    return (f"    if not {condition}:\n        raise BrokenVariant('the values broke {condition}: the model of {function} "
+    return (f"    try:\n        _holds = True if {condition} else False\n    except Exception:\n        _holds = False\n"
+            f"    if not _holds:\n        raise BrokenVariant('the values broke {condition}: the model of {function} "
             f"rejected this call')\n")
 
 PURE_SOURCES = {
@@ -1162,6 +1163,31 @@ def test_a_pure_package_raises_its_constraints(run_package):
     assert run_package(files, script, pure=True).splitlines() == [
         "BrokenVariant the values broke min <= x <= max: the model of randint rejected this call",
     ]
+
+
+def test_a_pure_constraint_that_cant_be_asked_is_broken(run_package):
+    # a checker's magic() is any object: one the condition raises an Exception for breaks the constraint, as one it
+    # is false of does; a BrokenVariant raised while asking it goes through as it is
+    files = compile_models(models, Compilation.MODEL_CHECKER, pure=True)
+    script = ("import builtins\nfrom compiled.random import randint\nfrom compiled._pymagic import BrokenVariant\n"
+              "class Odd(int):\n    def __ge__(self, other):\n        raise TypeError('no order')\n"
+              "class Inner(int):\n    def __ge__(self, other):\n        raise BrokenVariant('inner')\n"
+              "for value in (Odd(3), Inner(3)):\n    builtins.magic = lambda *kinds: value\n"
+              "    try:\n        randint(1, 6)\n    except BaseException as error:\n        print(type(error).__name__, error)")
+    assert run_package(files, script, pure=True).splitlines() == [
+        "BrokenVariant the values broke min <= x <= max: the model of randint rejected this call",
+        "BrokenVariant inner",
+    ]
+
+
+def test_a_pure_model_cant_use_the_name_of_a_constraints_condition():
+    def model__holds(a, b):
+        _holds = magic(int)
+        constraint(a <= _holds <= b)
+        return _holds
+    from PyMagic.compile import compile_function
+    with pytest.raises(UncompilableModel, match="uses _holds"):
+        compile_function(model__holds, random.randint, Compilation.MODEL_CHECKER, True)
 
 
 def test_raising_concretely_the_checks_raise_assertion_errors():
