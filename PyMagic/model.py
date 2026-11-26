@@ -58,6 +58,8 @@ class Model(Enum):
     MODULE = auto()    # @model(module) on a class: each @model(function) in it replaces that function everywhere
     FUNCTION = auto()  # @model(function) on a function: replaces that function everywhere
     PATCHES = auto()   # a plain {function: replacement} dict: each function is replaced as is
+    SPEC = auto()      # @spec on a function: a property of all its arguments, which models nothing; it is compiled
+                       # beside the models, and run_model has nothing to put in place for it
 
 def signature_of(original):
     try:
@@ -270,7 +272,8 @@ def magic(*kinds):
     match call.values:
         case None:
             raise RunningUnstatedModel(
-                f"{call} reached {place}, but no magics were given for it; pass them as run_model(models, magics)"
+                f"{call} reached {place}, but no magics were given for it; pass them as run_model(models, magics), "
+                f"or run_spec(models, magics) for a spec"
             )
         case ByPosition(values):
             pass
@@ -296,14 +299,18 @@ def magic(*kinds):
         )
     return value
 
+def source_at(frame, default):
+    # the line of source a frame is running and where it is, `constraint(a <= face <= b) (dice.py:20)`, with
+    # default for the line when its source isn't available
+    source = linecache.getline(frame.f_code.co_filename, frame.f_lineno).strip() or default
+    return f"{source} ({frame.f_code.co_filename}:{frame.f_lineno})"
+
 def constraint(condition):
     # the magic values drawn so far must make the condition true, otherwise the call is not one the
     # original could make
     if condition:
         return
-    caller = sys._getframe(1)
-    source = linecache.getline(caller.f_code.co_filename, caller.f_lineno).strip() or "constraint(...)"
-    where = f"{source} ({caller.f_code.co_filename}:{caller.f_lineno})"
+    where = source_at(sys._getframe(1), "constraint(...)")
     running = running_models.get()
     if not running:
         raise BrokenVariant(f"{where} failed outside any running model")

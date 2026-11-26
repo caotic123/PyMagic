@@ -20,6 +20,7 @@ from .model import (
     BrokenVariant, Model, code_objects, constraint, get_models, magic, model, model_members, name_of, named_only,
     signature_of,
 )
+from .specs import ConditionalPropertyRaise, SpecPropertyInvalid, always, exists, need
 
 
 class UncompilableModel(BaseException):
@@ -35,6 +36,47 @@ COMPILED_HEADERS = {
                                "# magic() values breaking a constraint fail its assert with a BrokenVariant",
     Compilation.CONCRETE: "# compiled from PyMagic models, with the real effects in place of magic()",
 }
+
+# the header of a module compiled for a model checker to run in pure Python, where constraints are raises
+PURE_CHECKER_HEADER = ("# compiled from PyMagic models for a model checker, which supplies magic()\n"
+                       "# magic() values breaking a constraint raise a BrokenVariant")
+
+# the line under the header of a compiled module that holds specs
+SPEC_HEADER = ("# arguments a spec's need() rules out raise a ConditionalPropertyRaise, and a counterexample to its always() "
+               "a SpecPropertyInvalid")
+
+# the PyMagic objects the compiled code names: a model checker's package has them in its _pymagic module
+COMPILER_NAMES = {
+    "BrokenVariant": BrokenVariant, "ConditionalPropertyRaise": ConditionalPropertyRaise,
+    "SpecPropertyInvalid": SpecPropertyInvalid,
+}
+
+# names the compiled code of a spec gives a need()'s condition, and the ConditionalPropertyRaise of another spec
+SPEC_NAMES = {"_met", "_unmet"}
+
+# the builtins that neither call nor iterate what they're given, so that calling one reaches no other spec: any
+# other call may, as all(map(spec, values)) does
+PLAIN_BUILTINS = {
+    "isinstance", "issubclass", "type", "len", "id", "callable", "hasattr", "getattr", "repr", "str", "int", "float",
+    "bool", "abs", "round", "divmod", "pow", "hash", "ord", "chr", "format",
+}
+
+# exists, as a package compiled for a model checker has it: it raises its BrokenExistentialQuantifier as exists does,
+# with no frames to say where it was made
+EXISTS = '''\
+class exists:
+    # that some value has a property, shown by one that does, the witness: exists(is_higher_than, 101). prop is
+    # what the property gives for the witness, true or a proof of it, like another exists
+    def __init__(self, property, witness):
+        self.property = property
+        self.witness = witness
+        self.prop = property(witness)
+        if not self.prop:
+            raise BrokenExistentialQuantifier(f"made {self!r}, but the property gives {self.prop!r} for the witness: the witness doesn't have the property")
+
+    def __repr__(self):
+        return f"exists({getattr(self.property, '__qualname__', self.property)}, {self.witness!r})"
+'''
 
 # names the concrete code gives the real result, the iterator of its magic values, the real exception and
 # the helper taking the real result's elements
@@ -222,13 +264,14 @@ def differing_default(func, original):
     ]
     return next(((mine, theirs) for mine, theirs in pairs if not same_default(mine.default, theirs.default)), None)
 
-def kind_assertion(name, kinds, flag=None):
-    # `assert isinstance(name, kind)` for a magic variable drawn with kinds, a tuple of them for several, failing
-    # with flag when there's one
-    if not kinds:
-        return []
+def kind_test(name, kinds):
+    # `isinstance(name, kind)` for a magic variable drawn with kinds, a tuple of them for several
     kind = kinds[0] if len(kinds) == 1 else ast.Tuple(kinds, ast.Load())
-    return [ast.Assert(ast.Call(ast.Name("isinstance", ast.Load()), [ast.Name(name, ast.Load()), kind], []), flag)]
+    return ast.Call(ast.Name("isinstance", ast.Load()), [ast.Name(name, ast.Load()), kind], [])
+
+def raise_unless(condition, exception):
+    # `if not condition: raise exception`
+    return ast.If(ast.UnaryOp(ast.Not(), condition), [ast.Raise(exception, None)], [])
 
 def rebinds(node, name, magic_statement):
     # whether the model's own code binds name anywhere besides its `name = magic()` statement
@@ -384,16 +427,32 @@ def concretion_of(node, magic_calls, magic_statements):
         return Concretion.ONE_VALUE
     return Concretion.ELEMENTS
 
+def calls(func, node, target):
+    # whether node, in func's code, is a call of target by its name, an alias of it, or through its module
+    # (PyMagic.magic)
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Name) and node.func.id == target.__name__:
+        return True
+    return resolve(func, node.func) is target
+
 class ModelCompiler(ast.NodeTransformer):
     # one pass over a model function's code, compiling each magic(), constraint(), return and raise it meets:
-    # constraint(c) becomes `assert c` everywhere, flagged with a BrokenVariant for a model checker; concrete
-    # compilation also rewrites the magic(), return and raise in the model's own scope for its concretion, leaving
-    # nested functions and classes alone
-    def __init__(self, func, name, compilation, concretion=None, result=None):
+    # constraint(c) becomes `assert c` everywhere, flagged with a BrokenVariant for a model checker, or, raising, as
+    # in a pure package, `if not c: raise BrokenVariant(...)`; concrete compilation also rewrites the magic(), return
+    # and raise in the model's own scope for its concretion, leaving nested functions and classes alone
+    def __init__(self, func, name, compilation, concretion=None, result=None, raises=False):
         self.func, self.name, self.compilation = func, name, compilation
         self.concretion, self.result = concretion, result
+        self.raises = raises
         self.constraints = []  # assertions to run right after the real call
         self.nested = 0
+
+    def check(self, condition, flag):
+        # `assert condition, flag`, or raising, `if not condition: raise flag`, an AssertionError without one
+        if not self.raises:
+            return ast.Assert(condition, flag)
+        return raise_unless(condition, flag or ast.Name("AssertionError", ast.Load()))
 
     def flag(self, *parts):
         # the BrokenVariant a constraint's assert fails with for a model checker; concretely, the values are the
@@ -403,12 +462,7 @@ class ModelCompiler(ast.NodeTransformer):
         return broken_variant(*parts, f": the model of {self.name} rejected this call")
 
     def calls(self, node, target):
-        # a call of target by its name, an alias of it, or through its module (PyMagic.magic)
-        if not isinstance(node, ast.Call):
-            return False
-        if isinstance(node.func, ast.Name) and node.func.id == target.__name__:
-            return True
-        return resolve(self.func, node.func) is target
+        return calls(self.func, node, target)
 
     def is_magic(self, node):
         return self.calls(node, magic)
@@ -443,7 +497,9 @@ class ModelCompiler(ast.NodeTransformer):
                 f"constraint() takes exactly one condition"
             )
         condition = statement.value.args[0]
-        return self.generic_visit(ast.Assert(condition, self.flag(f"the values broke {ast.unparse(condition)}")))
+        flag = self.flag(f"the values broke {ast.unparse(condition)}")
+        # the condition alone is visited: concretely, the raise of a check isn't the model's own
+        return self.check(self.visit(condition), flag)
 
     def kind_check(self, name, kinds):
         # magic(kinds)'s check of its value, as an assert
@@ -452,7 +508,7 @@ class ModelCompiler(ast.NodeTransformer):
         expected = " or ".join(map(ast.unparse, kinds))
         flag = self.flag(f"{name} = magic({', '.join(map(ast.unparse, kinds))}) drew ", ast.Name(name, ast.Load()),
                          f", which is not {expected}")
-        return kind_assertion(name, kinds, flag)
+        return [self.check(kind_test(name, kinds), flag)]
 
     def visit_Assign(self, statement):
         # name = magic(kinds), which is magic() followed by constraint(isinstance(name, kinds))
@@ -499,7 +555,7 @@ class ModelCompiler(ast.NodeTransformer):
             return statement
         result = ast.Name("_result", ast.Load())
         value = statement.value or ast.Constant(None)
-        return [ast.Assert(ast.Compare(value, [ast.Eq()], [result]), None), ast.Return(result)]
+        return [self.check(ast.Compare(value, [ast.Eq()], [result]), None), ast.Return(result)]
 
     def visit_Raise(self, statement):
         # the real effect has already returned, so a model reaching a raise disagrees with it
@@ -509,10 +565,11 @@ class ModelCompiler(ast.NodeTransformer):
         raised = ast.unparse(statement.exc) if statement.exc else "its exception again"
         return assertion_error(f"the real {self.name} returned ", self.result, f", but its model raises {raised} for it")
 
-def compile_function(func, original, compilation):
+def compile_function(func, original, compilation, raises=False):
     # (definition, helpers, real) of a model function compiled into a function named after its original:
-    # constraint(c) becomes `assert c`, and magic() stays for a model checker, or takes its values from one call
-    # to the original in concrete compilation, which real, (module, reference), says how to reach
+    # constraint(c) becomes `assert c`, or `if not c: raise ...` raising, and magic() stays for a model checker, or
+    # takes its values from one call to the original in concrete compilation, which real, (module, reference), says
+    # how to reach
     if func.__code__.co_freevars:
         raise UncompilableModel(
             f"{func.__qualname__} uses {list(func.__code__.co_freevars)} from the function around it, which the "
@@ -522,11 +579,11 @@ def compile_function(func, original, compilation):
     node.decorator_list = []
     node.name = original.__name__
     if compilation is Compilation.MODEL_CHECKER:
-        node.body = ModelCompiler(func, node.name, compilation).compile(node.body)
+        node.body = ModelCompiler(func, node.name, compilation, raises=raises).compile(node.body)
         return node, set(), None
-    return compile_concrete(func, original, node)
+    return compile_concrete(func, original, node, raises)
 
-def compile_concrete(func, original, node):
+def compile_concrete(func, original, node, raises=False):
     # rewrites node so the real effect runs first and fills the magic values: an exception it raises must be
     # one the model raises too, and once it has returned, the model's code checks its result; gives (node, the
     # helpers the compiled code needs, (module, reference) of the real effect)
@@ -541,7 +598,7 @@ def compile_concrete(func, original, node):
     # the real effect as the compiled module finds it on import, before the model is put in its place
     real_call = ast.Call(ast.Name(f"_real_{node.name}", ast.Load()), *passed_on(node.args))
 
-    compiler = ModelCompiler(func, node.name, Compilation.CONCRETE)
+    compiler = ModelCompiler(func, node.name, Compilation.CONCRETE, raises=raises)
     magic_calls = [call for call in ast.walk(node) if compiler.is_magic(call)]
     magic_statements = [(statement, magic_variable(statement, compiler.is_magic)) for statement in node.body]
     magic_statements = [(statement, name) for statement, name in magic_statements if name is not None]
@@ -588,6 +645,135 @@ def compile_concrete(func, original, node):
             f"from the real {name_of(original)}"
         )
     return node, helpers, (module_name, reference)
+
+# ------------------------------------------------------------------ specs
+
+def raising(test, error, message):
+    # `if not test: raise error(message)`
+    return raise_unless(test, ast.Call(ast.Name(error, ast.Load()), [ast.Constant(message)], []))
+
+class SpecCompiler(ast.NodeTransformer):
+    # one pass over a spec's code, compiling it to raises alone: always(c) becomes
+    # `if not c: raise SpecPropertyInvalid(...)` wherever it is, and need(c), a statement of the spec's own body
+    # alone, `if not c: raise ConditionalPropertyRaise(...)`. As when it runs, arguments that another spec it calls
+    # rules out are a step of this one that doesn't hold: the code that calls anything but a plain builtin, a
+    # need()'s condition too, runs in a try that turns the other spec's ConditionalPropertyRaise into a
+    # SpecPropertyInvalid. What only a spec that runs has, constraint() and another spec's forall(), doesn't compile
+    def __init__(self, func, node):
+        self.func, self.name = func, node.name
+        self.bound = bound_names(node)
+
+    def calls(self, node, target):
+        return calls(self.func, node, target)
+
+    def condition(self, call, kind):
+        if len(call.args) != 1 or call.keywords:
+            raise UncompilableModel(
+                f"{self.func.__qualname__} calls {ast.unparse(call)} (line {call.lineno}); {kind}() takes exactly one "
+                f"condition"
+            )
+        return call.args[0]
+
+    def is_plain(self, callee):
+        # a builtin that neither calls nor iterates its arguments, under its own name
+        return isinstance(callee, ast.Name) and callee.id in PLAIN_BUILTINS and callee.id not in self.bound and \
+            callee.id not in self.func.__globals__
+
+    def reaches_other_code(self, node):
+        # whether node calls anything but a plain builtin, and so could reach another spec, straight or through
+        # what it's given to call or iterate; need() and always() are this one's
+        return any(
+            isinstance(inner, ast.Call) and not self.is_plain(inner.func)
+            and not self.calls(inner, need) and not self.calls(inner, always)
+            for inner in ast.walk(node)
+        )
+
+    def relying(self, statements):
+        # statements in a try making a ConditionalPropertyRaise of another spec they call a SpecPropertyInvalid
+        unmet = ast.Name("_unmet", ast.Load())
+        message = ast.JoinedStr([
+            ast.Constant(f"{self.name} relies on what another spec says nothing of: "), ast.FormattedValue(unmet, -1, None),
+        ])
+        raised = ast.Raise(ast.Call(ast.Name("SpecPropertyInvalid", ast.Load()), [message], []), unmet)
+        return ast.Try(statements, [ast.ExceptHandler(ast.Name("ConditionalPropertyRaise", ast.Load()), "_unmet", [raised])], [], [])
+
+    def compile(self, body):
+        # the spec's own body: each need() raises outside any try, and each run of statements between them is in
+        # one when it calls other code
+        compiled, between, reaching = [], [], False
+        for statement in body:
+            if isinstance(statement, ast.Expr) and self.calls(statement.value, need):
+                compiled += [self.relying(between)] if reaching else between
+                between, reaching = [], False
+                compiled += self.need(statement.value)
+            else:
+                reaching = reaching or self.reaches_other_code(statement)
+                between += as_list(self.visit(statement))
+        return compiled + ([self.relying(between)] if reaching else between)
+
+    def need(self, call):
+        condition = self.condition(call, "need")
+        message = f"the arguments don't meet need({ast.unparse(condition)}): {self.name} says nothing of them"
+        if not self.reaches_other_code(condition):
+            return [raising(self.visit(condition), "ConditionalPropertyRaise", message)]
+        met = ast.Assign([ast.Name("_met", ast.Store())], self.visit(condition))
+        return [self.relying([met]), raising(ast.Name("_met", ast.Load()), "ConditionalPropertyRaise", message)]
+
+    def visit_Expr(self, statement):
+        # always(c) as a statement; need(c) anywhere but the spec's own body
+        call = statement.value
+        if self.calls(call, need):
+            raise UncompilableModel(
+                f"{self.func.__qualname__} calls {ast.unparse(call)} (line {call.lineno}) inside a block or a nested "
+                f"function; write need() as a statement of the spec's own body, which rules the arguments out before "
+                f"the rest of it runs"
+            )
+        if not self.calls(call, always):
+            return self.generic_visit(statement)
+        condition = self.condition(call, "always")
+        message = f"the arguments broke always({ast.unparse(condition)}): a counterexample to {self.name}"
+        return raising(self.visit(condition), "SpecPropertyInvalid", message)
+
+    def visit_Attribute(self, attribute):
+        # a compiled spec is a function, which the checker gives its arguments: it has no forall()
+        self.generic_visit(attribute)
+        if attribute.attr == "forall" and getattr(resolve(self.func, attribute.value), "__model_kind__", None) is Model.SPEC:
+            raise UncompilableModel(
+                f"{self.func.__qualname__} uses {ast.unparse(attribute)} (line {attribute.lineno}), which a compiled "
+                f"spec doesn't have: the checker gives a spec its arguments; call the spec with them"
+            )
+        return attribute
+
+    def visit_Call(self, call):
+        # need() and always() inside an expression, and constraint() anywhere
+        self.generic_visit(call)
+        if self.calls(call, constraint):
+            raise UncompilableModel(
+                f"{self.func.__qualname__} calls {ast.unparse(call)} (line {call.lineno}), which is a model's, for its "
+                f"magic() values; a spec states need() and always()"
+            )
+        for kind in (need, always):
+            if self.calls(call, kind):
+                raise UncompilableModel(
+                    f"{self.func.__qualname__} uses {ast.unparse(call)} (line {call.lineno}) inside an expression; "
+                    f"write {kind.__name__}() as its own statement so it compiles to a raise"
+                )
+        return call
+
+def compile_spec(func):
+    # the definition of a spec, compiled to raises alone, without @spec
+    if func.__code__.co_freevars:
+        raise UncompilableModel(
+            f"{func.__qualname__} uses {list(func.__code__.co_freevars)} from the function around it, which the "
+            f"compiled module can't see; move them to module level"
+        )
+    used = {name for code in code_objects(func.__code__) for name in code.co_varnames + code.co_names}
+    if taken := sorted(used & SPEC_NAMES):
+        raise UncompilableModel(f"{func.__qualname__} uses {taken}, which the compiled code of a spec needs; rename them")
+    node = function_node(func)
+    node.decorator_list = []
+    node.body = SpecCompiler(func, node).compile(node.body)
+    return node
 
 # ------------------------------------------------------------------ C specs
 
@@ -774,6 +960,21 @@ PURE_INIT = '''\
 
 PACKAGE_INIT = "# compiled from PyMagic models: a package of compiled modules\n"
 
+# what a package with specs says of them, in its __init__.py: a table, or comments in a pure package
+SPECS_TABLE = '''
+# (the spec's module, its name there, compiled module, the spec's name there): the specs, each a property of all its
+# arguments for the checker to check; arguments a need() rules out raise a ConditionalPropertyRaise, and a
+# counterexample raises a SpecPropertyInvalid
+SPECS = {specs}
+'''
+
+PURE_SPECS = '''#
+# and these specs, each a property of all its arguments: arguments a need() rules out raise a
+# ConditionalPropertyRaise, and a counterexample raises a SpecPropertyInvalid
+#
+{lines}
+'''
+
 class Span:
     # a stretch of source, positioned as the nodes of a syntax tree are: lines from 1, columns in UTF-8 bytes
     def __init__(self, lineno, col_offset, end_lineno, end_col_offset):
@@ -940,7 +1141,8 @@ class Package:
     def __init__(self, compilation, no_c_spec=False, pure=False):
         self.compilation = compilation
         self.checker = compilation is Compilation.MODEL_CHECKER
-        self.pure = pure                     # to run in pure Python: its __init__.py names the real modules alone
+        self.pure = pure                     # to run in pure Python: its __init__.py names the real modules alone,
+                                             # and its constraints are raises rather than asserts
         self.no_c_spec = no_c_spec or pure   # needing no C module but those Python's semantics rest on
         self.modules = {}
         self.placed = {}     # id(object): (compiled module, its name there) for every model and what's written
@@ -952,6 +1154,8 @@ class Package:
         self.model_packages = {__name__.split(".")[0]}
         self.modeled_by = {} # id(original): the model compiled for it
         self.modelled = set() # the modules the models stand in for
+        self.specs = []      # (spec, its module, the module it is compiled to, its name there)
+        self.spec_homes = set()  # the modules the specs are compiled to
 
     def module(self, name):
         if name not in self.modules:
@@ -1024,6 +1228,18 @@ class Package:
                     f"the plain patches of {[name_of(function) for function in entry]} have no model to compile; "
                     f"compile only @model classes and functions"
                 )
+            case Model.SPEC:
+                # a spec stands in for nothing: it goes under its own name, in the module of its module's name
+                if not self.checker:
+                    raise UncompilableModel(
+                        f"{entry.__qualname__} is a spec, which compiles for a model checker; with the real effects, "
+                        f"check it as it is, under run_spec"
+                    )
+                home = defining_module(entry).__name__
+                self.place(entry, home, entry.__name__, entry.__qualname__, unwrap(entry))
+                self.pending[id(entry)] = lambda entry=entry: self.write_spec(entry)
+                self.specs.append((entry, home, home, entry.__name__))
+                self.spec_homes.add(home)
 
     def replace(self, original, home, local):
         # an original the tables replace with its model: one the standard library holds, or, concretely, any
@@ -1035,7 +1251,7 @@ class Package:
             self.pending.pop(id(value))()
 
     def write_function(self, func, original):
-        node, helpers, real = compile_function(func, original, self.compilation)
+        node, helpers, real = compile_function(func, original, self.compilation, self.pure)
         home, local = self.placed[id(original)]
         module = self.module(home)
         module.helpers |= helpers
@@ -1057,7 +1273,7 @@ class Package:
         for name, member, modelled in model_members(entry):
             func = unwrap(member)
             if modelled is not None:
-                node = compile_function(func, modelled, self.compilation)[0]
+                node = compile_function(func, modelled, self.compilation, self.pure)[0]
             else:
                 node = function_node(func)
             node.name = name if modelled is None else modelled.__name__
@@ -1073,6 +1289,14 @@ class Package:
         home, local = self.placed[id(original)]
         methods = {name: (unwrap(member), modelled) for name, member, modelled in model_members(entry) if modelled}
         self.write_source(entry, home, local, entry.__qualname__, methods)
+
+    def write_spec(self, entry):
+        func = unwrap(entry)
+        node = compile_spec(func)
+        home, local = self.placed[id(entry)]
+        node.name = local
+        self.resolve_tree(node, func.__globals__, func.__module__, home, func.__qualname__)
+        self.module(home).blocks.append(ast.unparse(ast.fix_missing_locations(node)))
 
     # ---------------------------------------------------------------- what the models use
 
@@ -1095,8 +1319,8 @@ class Package:
         parents = {id(child): parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
         skipped = {id(node) for drop in dropped for node in ast.walk(drop)}
         replacements = {}
-        # the flags the compiler writes name PyMagic's BrokenVariant, wherever the model is
-        given = {"BrokenVariant": BrokenVariant} if self.checker else {}
+        # the flags and raises the compiler writes name PyMagic's BrokenVariant and spec errors, wherever the model is
+        given = COMPILER_NAMES if self.checker else {}
         for name_node in global_references(tree):
             if id(name_node) in skipped:
                 continue
@@ -1139,10 +1363,21 @@ class Package:
         module = self.module(home)
         if value is magic or value is constraint:
             return preferred
-        if preferred == "BrokenVariant" and value is not BrokenVariant and self.checker:
+        if value is need or value is always:
             raise UncompilableModel(
-                f"{user} uses a BrokenVariant of its own, but the compiled module defines BrokenVariant as PyMagic's; "
+                f"{user} uses {preferred}() outside a spec, where it doesn't compile; write it in the spec's own code"
+            )
+        if self.checker and COMPILER_NAMES.get(preferred, value) is not value:
+            raise UncompilableModel(
+                f"{user} uses a {preferred} of its own, but the compiled module defines {preferred} as PyMagic's; "
                 f"rename it"
+            )
+        if getattr(value, "__model_kind__", None) is Model.SPEC and id(value) not in self.placed:
+            self.add(Model.SPEC, value)  # a spec the compiled ones call is compiled with them
+        if getattr(value, "__model_kind__", None) is Model.FUNCTION and id(value) not in self.placed:
+            raise UncompilableModel(
+                f"{user} calls the model {preferred} itself, which has no magic values to draw: call "
+                f"{name_of(value.__model__)}, which the model stands in for"
             )
         if self.checker and is_constant(value):
             # a value that can't change is written where it's used, under the name it has there: the same number
@@ -1249,7 +1484,11 @@ class Package:
         # a function, class or module-level value of the project, written into home from its source; PyMagic's
         # own go into the package's _pymagic module
         if isinstance(value, (type, types.FunctionType)) and self.is_model_code(defining_module(value)):
-            where = PYMAGIC_MODULE if defining_module(value).__name__.split(".")[0] == __name__.split(".")[0] else home
+            # a model's go with it, into the module it stands in for; a spec's go into the module named after
+            # their own, as specs do, so that specs of two modules that share one don't import each other
+            defined = defining_module(value).__name__
+            where = PYMAGIC_MODULE if defined.split(".")[0] == __name__.split(".")[0] else \
+                defined if home in self.spec_homes else home
             local = self.free_name(where, value.__name__, value)
             self.place(value, where, local, user)
             self.write_source(value, where, local, user)
@@ -1276,7 +1515,7 @@ class Package:
         # a function or class as its source has it, without @model(), with its references renamed for home; the
         # methods of a class named in methods, {name: (function, original)}, compiled as model functions are
         module = defining_module(value)
-        source = source_of(value, module)
+        source = EXISTS if value is exists else source_of(value, module)
         if source is None:
             raise UncompilableModel(f"{user} uses {value.__name__}, whose source isn't available") from None
         tree = ast.parse(source)
@@ -1291,7 +1530,7 @@ class Package:
             replacements[Span(decorator.lineno, 0, decorator.end_lineno, end)] = ""
         for method in compiled:
             func, original = methods[method.name]
-            node = compile_function(func, original, self.compilation)[0]
+            node = compile_function(func, original, self.compilation, self.pure)[0]
             node.name = method.name
             self.resolve_tree(node, func.__globals__, func.__module__, home, f"{user}.{method.name}")
             first = min([method.lineno] + [decorator.lineno for decorator in method.decorator_list])
@@ -1385,10 +1624,12 @@ class Package:
         rows = [(module, name, relative(home), local) for module, name, home, local in self.rows()]
         standing_in = [(module, relative(home)) for module, home in self.standing_in()]
         packages = self.packages()
-        header = COMPILED_HEADERS[self.compilation]
+        header = PURE_CHECKER_HEADER if self.pure and self.checker else COMPILED_HEADERS[self.compilation]
         files = {}
+        specs = [(module, spec.__name__, relative(home), local) for spec, module, home, local in self.specs]
         for name, module in sorted(self.modules.items()):
-            parts = [header, *sorted(module.imports), *("\n\n" + block for block in [*sorted(module.helpers), *module.blocks])]
+            heading = f"{header}\n{SPEC_HEADER}" if name in self.spec_homes else header
+            parts = [heading, *sorted(module.imports), *("\n\n" + block for block in [*sorted(module.helpers), *module.blocks])]
             files[module_file(name, packages)] = "\n".join(parts) + "\n"
         for name in sorted(packages - set(self.modules)):
             files[module_file(name, packages)] = PACKAGE_INIT
@@ -1396,6 +1637,9 @@ class Package:
             lines = [f"#   {module}.{name} -> {home}.{local}" for module, name, home, local in rows]
             lines += [f"#   {module} -> {home}, whole" for module, home in standing_in]
             files["__init__.py"] = PURE_INIT.format(lines="\n".join(lines) or "#   (nothing)")
+            if specs:
+                files["__init__.py"] += PURE_SPECS.format(
+                    lines="\n".join(f"#   {module}.{name} -> {home}.{local}" for module, name, home, local in specs))
             for path, source in files.items():
                 try:
                     compile(source, path, "exec")
@@ -1404,6 +1648,8 @@ class Package:
         else:
             files["__init__.py"] = PACKAGE_TABLES.format(
                 placing=PLACING[self.compilation], replaced=pretty(rows), standing_in=pretty(standing_in))
+            if specs:
+                files["__init__.py"] += SPECS_TABLE.format(specs=pretty(specs))
         if self.no_c_spec and (needed := c_specs_needed(files)):
             raise UncompilableModel(
                 "with no C specs, the package can need no C module but those Python's own semantics rest on, and it "

@@ -125,6 +125,123 @@ A magic generator can also give values by the variable that `magic()` is assigne
 'doubles: you win a pizza'
 ```
 
+## Write a spec: what holds for every argument
+
+A spec is a function that states a property of all its arguments. `need()` says which arguments it speaks of,
+and `always()` says what holds of them. An argument that fails a `need()` raises `ConditionalPropertyRaise`: the
+spec says nothing of it. One that meets every `need()` but fails an `always()` raises `SpecPropertyInvalid`: it is a
+counterexample.
+
+```python
+from PyMagic import always, need, spec
+
+
+@spec
+def max_property(x, y):
+    need(isinstance(x, int) and isinstance(y, int))
+    need(x and y)
+    always(max(x, y) >= y)
+```
+
+Called with arguments, a spec checks them. `forall()` checks every combination of the values given for each
+argument, and gives back which ones held and which a `need()` left out. The first combination that fails an
+`always()` raises its `SpecPropertyInvalid`:
+
+```python
+>>> max_property(3, 1)
+>>> max_property(0, 3)
+ConditionalPropertyRaise: max_property(0, 3) doesn't meet need(x and y) (max.py:7): max_property says nothing of these arguments
+>>> max_property.forall(x=[0, 1, -2], y=[2, 3])
+Checked(held=[(1, 2), (1, 3), (-2, 2), (-2, 3)], unmet=[(0, 2), (0, 3)])
+```
+
+A spec can check a program under its models. Here is one for the dice game, over the faces both dice land on:
+
+```python
+@spec
+def snake_eyes_only_on_ones(first, second):
+    need(1 <= first <= 6 and 1 <= second <= 6)
+    always(throw(first, second).startswith("snake eyes") == (first == second == 1))
+```
+
+```python
+>>> checked = snake_eyes_only_on_ones.forall(first=range(8), second=range(8))
+>>> len(checked.held), len(checked.unmet)
+(36, 28)
+```
+
+Without the `need()`, `throw(7, 3)` would raise the model's `BrokenVariant`. No die shows a 7, so that is no case
+of the spec, and the spec must rule it out with a `need()`.
+
+### Run a spec with its models
+
+`run_spec(models, magics)` runs a spec, or its `forall()`, as `run_model` runs a program: the models it reaches
+draw their `magic()` values from the magics, and the user gives every one. `run_model` refuses a spec, and
+`run_spec` anything but one; a program that calls a spec is still a program, for `run_model`. With `forall()`, the cases draw them one after the other, and a case that a
+`need()` leaves out draws none. A value that isn't given raises `RunningUnstatedModel`, and one the original
+couldn't give raises `BrokenVariant`. Either way the error says which spec call wanted the value, and it is neither a
+case left out nor a counterexample: `forall()` stops at it.
+
+```python
+def roll(n):
+    return [random.randint(1, 6) for _ in range(n)]
+
+
+@spec
+def rolls_show_faces(n):
+    need(isinstance(n, int) and n >= 0)
+    rolls = roll(n)
+    always(len(rolls) == n and all(1 <= face <= 6 for face in rolls))
+```
+
+```python
+>>> run_spec([randint], dice(3, 4))(rolls_show_faces, 2)
+>>> run_spec([randint], dice(3, 4, 5))(rolls_show_faces.forall, n=[-1, 0, 1, 2])
+Checked(held=[(0,), (1,), (2,)], unmet=[(-1,)])
+>>> run_spec([randint], dice(3, 4))(rolls_show_faces.forall, n=[1, 2])
+RunningUnstatedModel: checking rolls_show_faces(n=2): randint(1, 6) ran out of magic values at face = magic(int) (dice.py:20); its magic generator stopped before giving one (use itertools.cycle([...]) to repeat values)
+```
+
+### There exists
+
+`exists(property, witness)` shows that some value has a property by giving one that does. It keeps the
+`property`, the `witness`, and `prop`, which is what the property gives for the witness. A witness without the
+property raises `BrokenExistentialQuantifier`, which is a `SpecPropertyInvalid`, so a spec that makes one is broken.
+One spec can make an existential, and another can take one:
+
+```python
+from PyMagic import exists
+
+
+def is_higher_than(n):
+    return n > 100
+
+
+@spec
+def witness_succ_exists(x):
+    # every int has one above it: x + 1
+    need(isinstance(x, int))
+    return exists(lambda y: y > x, x + 1)
+
+
+@spec
+def example_receive_existential(x):
+    need(isinstance(x, exists))
+    need(x.property is is_higher_than)
+    always(is_higher_than(x.witness + 1))
+```
+
+```python
+>>> witness_succ_exists(41).witness
+42
+>>> example_receive_existential(exists(is_higher_than, 101))
+>>> exists(is_higher_than, 5)
+BrokenExistentialQuantifier: made exists(is_higher_than, 5) at exists(...) (<stdin>:1), but is_higher_than(5) is False: the witness doesn't have the property
+```
+
+A spec that calls another must meet the other's needs. If it passes arguments the other says nothing of, the
+caller raises `SpecPropertyInvalid`: its own case is a counterexample, not one to leave out.
+
 ## Model a library: a fortune cookie service over httplib2
 
 `http_model` models httplib2, and `stdlib_model` models the parts of the standard library it uses.
@@ -221,7 +338,8 @@ model's. That is how the tests check the model against Linux: the same programs 
 
 A model compiles to a package of Python modules: one for each module the models stand in for, and an
 `__init__.py` that says which original each model stands in for. Compiled for a model checker, `magic()` is left
-for the checker to supply, and constraints become asserts that fail with a `BrokenVariant`. The package imports
+for the checker to supply, and constraints become asserts that fail with a `BrokenVariant` (with `--pure`, raises
+of it). The package imports
 nothing of the system a checker can't run, like `sys`, `os` or `socket`: what the models read of it, like
 `sys.byteorder`, is written in as a literal, and a model that calls into it doesn't compile. With the dice game
 saved as `dice.py`:
@@ -320,11 +438,89 @@ compile, and its `__init__.py` has no tables, only comments naming the real modu
 #   random.randint -> .random.randint
 ```
 
+Its constraints are raises, not asserts, so that a broken one raises the `BrokenVariant` itself rather than an
+`AssertionError` holding it, even under `python -O`:
+
+```python
+def randint(a, b):
+    face = magic(int)
+    if not isinstance(face, int):
+        raise BrokenVariant(f'face = magic(int) drew {face!r}, which is not int: the model of randint rejected this call')
+    if not a <= face <= b:
+        raise BrokenVariant('the values broke a <= face <= b: the model of randint rejected this call')
+    return face
+```
+
 The httplib2 model compiles pure: the models reach base64 and HMAC through the `binascii` and `_hashlib` models,
 not through `base64` and `hmac`, which need C.
 
 From Python, `compile_models(models, Compilation.MODEL_CHECKER)` returns the package as `{path: source}`, and
 `write_package(files, directory)` writes it; `no_c_spec=True` and `pure=True` are the flags.
+
+### Compile a spec
+
+Specs go in the list with the models, or on their own. They compile for a model checker only: with the real effects,
+a spec is checked as it is, under `run_spec`. A spec stands in for nothing, so it is compiled under its own name,
+into the module named after its own. Nothing of PyMagic is left in it but exceptions: each `need()` raises
+`ConditionalPropertyRaise`, and each `always()` raises `SpecPropertyInvalid`. With the specs of `max.py` in a list,
+`specs = [max_property, witness_succ_exists, example_receive_existential]`:
+
+```bash
+python3.10 -m PyMagic compile max:specs --pure -o out/compiled
+```
+
+That writes `out/compiled/max.py`, which has:
+
+```python
+def max_property(x, y):
+    if not (isinstance(x, int) and isinstance(y, int)):
+        raise ConditionalPropertyRaise("the arguments don't meet need(isinstance(x, int) and isinstance(y, int)): max_property says nothing of them")
+    if not (x and y):
+        raise ConditionalPropertyRaise("the arguments don't meet need(x and y): max_property says nothing of them")
+    try:
+        if not max(x, y) >= y:
+            raise SpecPropertyInvalid('the arguments broke always(max(x, y) >= y): a counterexample to max_property')
+    except ConditionalPropertyRaise as _unmet:
+        raise SpecPropertyInvalid(f'max_property relies on what another spec says nothing of: {_unmet}') from _unmet
+
+
+def witness_succ_exists(x):
+    if not isinstance(x, int):
+        raise ConditionalPropertyRaise("the arguments don't meet need(isinstance(x, int)): witness_succ_exists says nothing of them")
+    try:
+        return exists(lambda y: y > x, x + 1)
+    except ConditionalPropertyRaise as _unmet:
+        raise SpecPropertyInvalid(f'witness_succ_exists relies on what another spec says nothing of: {_unmet}') from _unmet
+```
+
+The checker supplies the arguments of a spec, every one it can: that is the "for all". A `ConditionalPropertyRaise`
+leaves them out, and a `SpecPropertyInvalid` is a counterexample. Code that calls anything runs in a `try`, so that
+when another spec it reaches rules out what it's given, that's a counterexample to this one, as it is when the spec
+runs. Only the builtins that neither call nor iterate what they're given, like `isinstance`, go without one: `max`
+gets one, as it can be given a `key` to call or a generator to run. `_pymagic.py` has the exceptions, and `exists` in plain Python. A pure package's `__init__.py`
+names the specs after the models:
+
+```python
+#   (nothing)
+#
+# and these specs, each a property of all its arguments: arguments a need() rules out raise a
+# ConditionalPropertyRaise, and a counterexample raises a SpecPropertyInvalid
+#
+#   max.max_property -> .max.max_property
+#   max.witness_succ_exists -> .max.witness_succ_exists
+#   max.example_receive_existential -> .max.example_receive_existential
+```
+
+Without `--pure`, they are in a `SPECS` table, with rows like those of `REPLACED`.
+
+- A spec that a compiled spec calls is compiled with it. What a spec uses of its project is compiled into the
+  module named after the one that defines it.
+- A spec doesn't compile if it calls `constraint()`, another spec's `forall()`, or a model function by its own
+  name: only a spec that runs has those. A model is reached through the original it stands in for.
+- `need()` compiles only as a statement of the spec's own body, not inside a block or a nested function, so that it
+  rules the arguments out before the rest of the spec runs. `always()` compiles anywhere in the spec's own code, but
+  not in a function the spec calls.
+- With `--pure`, the models' constraints are raises too, so the package has no `assert`.
 
 # Command line
 
@@ -334,22 +530,23 @@ pymagic compile MODELS [-o DIRECTORY] [--concrete] [--no-C-spec] [--pure] [--for
 
 `pymagic` is installed with the package; `python3.10 -m PyMagic` does the same.
 
-- `MODELS` is `module:attribute`, naming a model or a list of them, like `dice:randint` or
-  `stdlib_model.random:_model_random`. A module alone, like `http_model`, compiles its `models` list.
+- `MODELS` is `module:attribute`, naming a model, a spec, or a list of them, like `dice:randint`,
+  `stdlib_model.random:_model_random` or `max:specs`. A module alone, like `http_model`, compiles its `models` list.
 - Without `-o`, the package's files are printed. With `-o DIRECTORY`, they're written there. A directory that
   isn't empty is written into only with `--force`, which overwrites the files it writes and keeps the others.
 - `--concrete` compiles the models to call the real effects in place of `magic()`, checking each result against
   the model, instead of compiling them for a model checker.
 - `--no-C-spec` refuses a package that needs a C module, but those Python's own semantics rest on.
-- `--pure` compiles a package to run in pure Python: it has no C specs, and its `__init__.py` names the real
-  modules in comments alone.
+- `--pure` compiles a package to run in pure Python: it has no C specs, its constraints raise rather than assert,
+  and its `__init__.py` names the real modules in comments alone.
 - If the models can't be compiled, the reason is printed and the exit code is 1. If they can't be found, the exit
   code is 2. `python3.10 -m PyMagic compile --help` shows this too.
 
 # What's here
 
-- `PyMagic/`: the library. `model.py` has `@model`, `magic()` and `constraint()`; `run.py` has `run_model`;
-  `compile.py` has `compile_models`; `cli.py` has the command line.
+- `PyMagic/`: the library. `model.py` has `@model`, `magic()` and `constraint()`; `run.py` has `run_model` and
+  `run_spec`; `specs.py` has `@spec`, `need()`, `always()` and `exists`; `compile.py` has `compile_models`; `cli.py`
+  has the command line.
 - `http_model/`: a model of httplib2, laid out as httplib2 is.
 - `stdlib_model/`: models of the standard library modules the httplib2 model reaches, and of sockets, a folder
   for each. `stdlib_model/magics.py` has the magics that answer them: a clock, a seeded random generator, and a

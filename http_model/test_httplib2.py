@@ -762,6 +762,12 @@ ANSWERS = [
     "[]",
 ]
 
+# in pure Python, the broken constraint raises its BrokenVariant rather than failing an assert
+PURE_ANSWERS = [
+    *ANSWERS[:3], "BrokenVariant: the values broke 101 <= status <= 999: the model of request rejected this call",
+    *ANSWERS[4:],
+]
+
 def requests(reaching):
     # the script of the six requests, with a gzipped body made here, as zlib may be the compiled one there
     return f"SQUEEZED = {gzip.compress(b'squeezed', mtime=0)!r}\n" + REQUESTS.replace("REACHING", reaching)
@@ -799,7 +805,7 @@ def test_whole_model_runs_compiled_where_its_tables_place_it(run_package):
 def test_whole_model_compiles_pure_and_runs_in_pure_python(run_package):
     files = compile_models(models, Compilation.MODEL_CHECKER, pure=True)
     reaching = "from compiled import httplib2\nfrom compiled._socket import gaierror"
-    assert run_package(files, requests(reaching), pure=True).splitlines() == ANSWERS
+    assert run_package(files, requests(reaching), pure=True).splitlines() == PURE_ANSWERS
 
 def top_level_names(source):
     # the names a module binds at its top level

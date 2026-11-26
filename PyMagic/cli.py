@@ -27,8 +27,9 @@ def main(argv=None):
                     "with the tables of the originals they stand in for, which whoever runs the package puts them in "
                     "place of. For a model checker, magic() is left for it to supply.",
     )
-    compiling.add_argument("models", help="module:attribute naming a model or a list of them, or a module whose "
-                                          "`models` list is compiled (e.g. http_model, stdlib_model.random:_model_random)")
+    compiling.add_argument("models", help="module:attribute naming a model, a spec, or a list of them, or a module "
+                                          "whose `models` list is compiled (e.g. http_model, "
+                                          "stdlib_model.random:_model_random)")
     compiling.add_argument("-o", "--output", metavar="DIRECTORY",
                            help="the package's directory, written; without it, its files are printed")
     compiling.add_argument("--concrete", action="store_true",
@@ -37,8 +38,9 @@ def main(argv=None):
                            help="refuse a package that needs a C module of the standard library, through any module "
                                 "it imports, but those Python's own semantics rest on")
     compiling.add_argument("--pure", action="store_true",
-                           help="compile to run in pure Python: --no-C-spec, every module checked to compile, and an "
-                                "__init__.py of comments alone, naming the real modules")
+                           help="compile to run in pure Python: --no-C-spec, every module checked to compile, "
+                                "constraints that raise rather than assert, and an __init__.py of comments alone, "
+                                "naming the real modules")
     compiling.add_argument("--force", action="store_true", help="write into an output directory that isn't empty")
     arguments = parser.parse_args(argv)
 

@@ -1121,14 +1121,58 @@ def test_a_package_says_what_its_models_stand_in_for_and_runs_nothing():
         assert "    ('random', 'randint', '.random', 'randint'),\n" in init and PLACING[compilation] in init
 
 
+PURE_HEADER = (
+    "# compiled from PyMagic models for a model checker, which supplies magic()\n"
+    "# magic() values breaking a constraint raise a BrokenVariant\n"
+)
+
+def raised_unless_kind(name, kinds, function):
+    # the raise of magic(kinds)'s value of the wrong kind, in a pure package
+    return (f"    if not isinstance({name}, {kinds}):\n        raise BrokenVariant(f'{name} = magic({kinds}) drew {{{name}!r}}, "
+            f"which is not {kinds}: the model of {function} rejected this call')\n")
+
+def raised_unless(condition, function):
+    # the raise of a broken constraint(condition), in a pure package
+    return (f"    if not {condition}:\n        raise BrokenVariant('the values broke {condition}: the model of {function} "
+            f"rejected this call')\n")
+
+PURE_SOURCES = {
+    "_pymagic.py": PURE_HEADER + "\n\n" + BROKEN_VARIANT_CLASS,
+    "random.py": PURE_HEADER + "from ._pymagic import BrokenVariant\n\n\n"
+    "def randint(min, max):\n    x = magic(int)\n" + raised_unless_kind("x", "int", "randint")
+    + raised_unless("min <= x <= max", "randint") + "    return x\n",
+    "builtins.py": PURE_HEADER + "from ._pymagic import BrokenVariant\n\n\n"
+    "def input(prompt=''):\n    x = magic(str)\n" + raised_unless_kind("x", "str", "input") + "    return x\n",
+}
+
 def test_a_pure_package_names_the_real_modules_in_comments_alone(run_package):
     files = compile_models(models, Compilation.MODEL_CHECKER, pure=True)
     assert ast.parse(files["__init__.py"]).body == []
     assert "#   random.randint -> .random.randint\n" in files["__init__.py"]
-    assert {path: source for path, source in files.items() if path != "__init__.py"} == \
-        {path: source for path, source in compile_models(models, Compilation.MODEL_CHECKER).items() if path != "__init__.py"}
     script = "import builtins\nbuiltins.magic = lambda *kinds: 4\nfrom compiled.random import randint\nprint(randint(1, 6))"
     assert run_package(files, script, pure=True).split() == ["4"]
+
+
+def test_a_pure_package_raises_its_constraints(run_package):
+    # the constraints raise their BrokenVariant, where a package that isn't pure asserts them
+    files = compile_models(models, Compilation.MODEL_CHECKER, pure=True)
+    assert {path: source for path, source in files.items() if path != "__init__.py"} == PURE_SOURCES
+    script = ("import builtins\nbuiltins.magic = lambda *kinds: 9\nfrom compiled.random import randint\n"
+              "try:\n    randint(1, 6)\nexcept BaseException as error:\n    print(type(error).__name__, error)")
+    assert run_package(files, script, pure=True).splitlines() == [
+        "BrokenVariant the values broke min <= x <= max: the model of randint rejected this call",
+    ]
+
+
+def test_raising_concretely_the_checks_raise_assertion_errors():
+    # a concrete check raises as its assert would fail, rather than as a raise of the model's own
+    from inspect import unwrap
+    from PyMagic.compile import compile_function
+    node, _, _ = compile_function(unwrap(_model_Random.model_randomint), random.randint, Compilation.CONCRETE, True)
+    source = ast.unparse(ast.fix_missing_locations(node))
+    assert "    if not isinstance(x, int):\n        raise AssertionError\n" in source
+    assert "    if not min <= x <= max:\n        raise AssertionError\n" in source
+    assert not any(isinstance(statement, ast.Assert) for statement in ast.walk(node))
 
 
 def encoded(data):
