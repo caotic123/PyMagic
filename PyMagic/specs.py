@@ -8,7 +8,7 @@ import dataclasses
 from contextvars import ContextVar
 
 from .model import (
-    BrokenVariant, Model, RunningUnstatedModel, format_call, name_of, shown, signature_of, source_at,
+    BrokenVariant, Model, RunningUnstatedModel, format_call, name_of, shown, signature_of, source_at, unasked,
 )
 
 
@@ -127,6 +127,17 @@ def spec(func=None):
                 raise
             # another spec it calls says nothing of what it's given: a step of this one that doesn't hold
             raise SpecPropertyInvalid(f"{call} relies on what another spec says nothing of: {error}") from error
+        except (AttributeError, TypeError) as error:
+            # arguments a need() can't be asked of, as an int of need(x.balance >= 0): the spec says nothing of them
+            where = unasked(func, error.__traceback__, need, any_object_only=False)
+            if where is None:
+                raise
+            unmet = ConditionalPropertyRaise(
+                f"{call} doesn't meet {where}, which can't be asked of them: {name_of(func)} says nothing of these "
+                f"arguments"
+            )
+            unmet.call = call
+            raise unmet from error
         except (RunningUnstatedModel, BrokenVariant) as error:
             # a model it runs wasn't given its values, or not ones its original could give: the user gives every
             # value, and the error says which spec call wanted them, the innermost one

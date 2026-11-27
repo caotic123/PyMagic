@@ -129,7 +129,7 @@ A magic generator can also give values by the variable that `magic()` is assigne
 
 A spec is a function that states a property of all its arguments. `need()` says which arguments it speaks of,
 and `always()` says what holds of them. An argument that fails a `need()` raises `ConditionalPropertyRaise`: the
-spec says nothing of it. One that meets every `need()` but fails an `always()` raises `SpecPropertyInvalid`: it is a
+spec says nothing of it, nor of one the `need()` can't be asked of, as an int of `need(account.balance >= 0)`. One that meets every `need()` but fails an `always()` raises `SpecPropertyInvalid`: it is a
 counterexample.
 
 ```python
@@ -446,18 +446,36 @@ def randint(a, b):
     face = magic(int)
     if not isinstance(face, int):
         raise BrokenVariant(f'face = magic(int) drew {face!r}, which is not int: the model of randint rejected this call')
-    try:
-        _holds = True if a <= face <= b else False
-    except Exception:
-        _holds = False
-    if not _holds:
+    if not a <= face <= b:
         raise BrokenVariant('the values broke a <= face <= b: the model of randint rejected this call')
     return face
 ```
 
-A checker's `magic()` is any object at all, so a condition may not even be askable of it: `account.balance >= 0`
-of an object with no `balance` raises an `AttributeError`. Such values break the constraint, as those it is false
-of do: an `Exception` raised while asking the condition is a `BrokenVariant`.
+### Values of no kind
+
+A `magic()` of no kind is any object at all, so a condition may not even be askable of its value:
+`answer.balance >= 0` of an object with no `balance` raises an `AttributeError`. Such a value breaks the
+constraint, as one it is false of does, at run time and in every compiled package alike. A constraint that reads a
+value of no kind is asked in a `try`:
+
+```python
+def balance_of(account):
+    answer = magic()
+    try:
+        if not answer.balance >= 0:
+            raise BrokenVariant('the values broke answer.balance >= 0: the model of balance_of rejected this call')
+    except (AttributeError, TypeError):
+        raise BrokenVariant('the values broke answer.balance >= 0: the model of balance_of rejected this call')
+    return answer.balance
+```
+
+- Only an `AttributeError` or a `TypeError` breaks it, and that error is the `BrokenVariant`'s context (its
+  cause, at run time). Any other error, like a `NameError` from a typo, goes through, and so does a
+  `BrokenVariant` raised while asking.
+- A value of `magic(int)` is an int: a constraint that reads only values with a kind isn't asked in a `try`, so a
+  bad argument raises its own error. `randint('1', 6)` raises the `TypeError` of `'1' <= face`.
+- The kind check is in a `try` too when a kind runs Python to check, as an ABC or a protocol does: a value whose
+  kind can't be asked is none of the kinds.
 
 The httplib2 model compiles pure: the models reach base64 and HMAC through the `binascii` and `_hashlib` models,
 not through `base64` and `hmac`, which need C.

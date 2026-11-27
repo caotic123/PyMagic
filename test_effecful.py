@@ -1,4 +1,5 @@
 import os
+import abc
 import ast
 import sys
 import math
@@ -15,7 +16,7 @@ from unittest import mock
 import pytest
 
 import PyMagic
-from PyMagic.compile import PACKAGE_INIT, PLACING, c_specs_needed
+from PyMagic.compile import ORACLE_IMPORT, PACKAGE_INIT, PLACING, c_specs_needed
 from PyMagic import (
     BrokenVariant, MissedModelObject, RunningUnstatedModel, UncompilableModel,
     Compilation, Model, collect_magic, compile_models, constraint, get_models, magic, model, named, run_model,
@@ -1133,16 +1134,15 @@ def raised_unless_kind(name, kinds, function):
 
 def raised_unless(condition, function):
     # the raise of a broken constraint(condition), in a pure package
-    return (f"    try:\n        _holds = True if {condition} else False\n    except Exception:\n        _holds = False\n"
-            f"    if not _holds:\n        raise BrokenVariant('the values broke {condition}: the model of {function} "
+    return (f"    if not {condition}:\n        raise BrokenVariant('the values broke {condition}: the model of {function} "
             f"rejected this call')\n")
 
 PURE_SOURCES = {
     "_pymagic.py": PURE_HEADER + "\n\n" + BROKEN_VARIANT_CLASS,
-    "random.py": PURE_HEADER + "from ._pymagic import BrokenVariant\n\n\n"
+    "random.py": PURE_HEADER + "from ._pymagic import BrokenVariant\n\n" + ORACLE_IMPORT + "\n\n\n"
     "def randint(min, max):\n    x = magic(int)\n" + raised_unless_kind("x", "int", "randint")
     + raised_unless("min <= x <= max", "randint") + "    return x\n",
-    "builtins.py": PURE_HEADER + "from ._pymagic import BrokenVariant\n\n\n"
+    "builtins.py": PURE_HEADER + "from ._pymagic import BrokenVariant\n\n" + ORACLE_IMPORT + "\n\n\n"
     "def input(prompt=''):\n    x = magic(str)\n" + raised_unless_kind("x", "str", "input") + "    return x\n",
 }
 
@@ -1165,29 +1165,157 @@ def test_a_pure_package_raises_its_constraints(run_package):
     ]
 
 
-def test_a_pure_constraint_that_cant_be_asked_is_broken(run_package):
-    # a checker's magic() is any object: one the condition raises an Exception for breaks the constraint, as one it
-    # is false of does; a BrokenVariant raised while asking it goes through as it is
-    files = compile_models(models, Compilation.MODEL_CHECKER, pure=True)
-    script = ("import builtins\nfrom compiled.random import randint\nfrom compiled._pymagic import BrokenVariant\n"
-              "class Odd(int):\n    def __ge__(self, other):\n        raise TypeError('no order')\n"
-              "class Inner(int):\n    def __ge__(self, other):\n        raise BrokenVariant('inner')\n"
-              "for value in (Odd(3), Inner(3)):\n    builtins.magic = lambda *kinds: value\n"
-              "    try:\n        randint(1, 6)\n    except BaseException as error:\n        print(type(error).__name__, error)")
-    assert run_package(files, script, pure=True).splitlines() == [
-        "BrokenVariant the values broke min <= x <= max: the model of randint rejected this call",
-        "BrokenVariant inner",
+class Account:
+    def __init__(self, balance):
+        self.balance = balance
+
+
+def balance_of(account):
+    return account.balance
+
+
+@model(balance_of)
+def model_balance_of(account):
+    # what the bank answers is any object, of no kind
+    answer = magic()
+    constraint(answer.balance >= 0)
+    return answer.balance
+
+
+class Shaped(abc.ABC):
+    # an ABC whose isinstance() can't tell
+    @classmethod
+    def __subclasshook__(cls, other):
+        raise TypeError("can't tell")
+
+
+def shaped():
+    return None
+
+
+@model(shaped)
+def model_shaped():
+    value = magic(Shaped)
+    return value
+
+
+ASKING = """
+import builtins
+from compiled.test_effecful import balance_of
+from compiled._pymagic import BrokenVariant
+
+class Account:
+    def __init__(self, balance):
+        self.balance = balance
+
+class Raising:
+    def __init__(self, error):
+        self.error = error
+    @property
+    def balance(self):
+        raise self.error
+
+for answer in (Account(3), Account(-1), object(), Raising(ValueError("no balance")), Raising(BrokenVariant("inner"))):
+    builtins.magic = lambda *kinds: answer
+    try:
+        print("returned", balance_of(None))
+    except BaseException as error:
+        print(type(error).__name__, error, "|", type(error.__context__).__name__)
+"""
+
+
+def test_a_constraint_that_cant_be_asked_of_any_object_is_broken(run_package):
+    # a value of magic() of no kind is any object: one without what the condition asks for breaks it, as one it is
+    # false of does, and the error it raised is the BrokenVariant's context; any other error goes through
+    broken = "BrokenVariant the values broke answer.balance >= 0: the model of balance_of rejected this call"
+    assert run_package(compile_models([model_balance_of], Compilation.MODEL_CHECKER, pure=True), ASKING,
+                       pure=True).splitlines() == [
+        "returned 3",
+        f"{broken} | NoneType",
+        f"{broken} | AttributeError",
+        "ValueError no balance | NoneType",
+        "BrokenVariant inner | NoneType",
     ]
 
 
-def test_a_pure_model_cant_use_the_name_of_a_constraints_condition():
-    def model__holds(a, b):
+def test_a_condition_that_cant_be_asked_breaks_alike_at_run_time_and_in_every_package():
+    # at run time
+    answers = {THIS_MODULE: {balance_of: lambda account: [object()]}}
+    with pytest.raises(BrokenVariant, match=r"model_balance_of\(None\) drew \[<object object at .*>\] and broke "
+                                            r"constraint\(answer.balance >= 0\) \(.*\), which can't be asked of them") as broken:
+        run_model([model_balance_of], answers)(lambda: balance_of(None))
+    assert isinstance(broken.value.__cause__, AttributeError)
+    # compiled with asserts, it fails its assert with the BrokenVariant
+    namespace = run_compiled([model_balance_of], Compilation.MODEL_CHECKER, {"magic": lambda: object()})
+    with pytest.raises(AssertionError) as failed:
+        namespace["balance_of"](None)
+    assert isinstance(failed.value.args[0], namespace["BrokenVariant"])
+    assert isinstance(failed.value.__context__, AttributeError)
+
+
+def test_a_bad_argument_is_no_broken_variant(run_package):
+    # x = magic(int) is an int: '1' <= x raises its TypeError, at run time and compiled alike
+    script = ("import builtins\nbuiltins.magic = lambda *kinds: 3\nfrom compiled.random import randint\n"
+              "try:\n    randint('1', 6)\nexcept BaseException as error:\n    print(type(error).__name__)")
+    for pure in (False, True):
+        files = compile_models(models, Compilation.MODEL_CHECKER, pure=pure)
+        assert run_package(files, script, pure=pure).split() == ["TypeError"]
+    with pytest.raises(TypeError, match="not supported between instances of 'str' and 'int'"):
+        run_model(models, {random: {random.randint: lambda min, max: [3]}})(lambda: random.randint("1", 6))
+
+
+def test_a_model_bug_in_a_constraint_goes_through():
+    # a NameError isn't the values' doing, even in a condition that reads any object
+    @model(balance_of)
+    def model_typo(account):
+        answer = magic()
+        constraint(answer.balance >= minimum_balance)  # noqa: F821, the typo
+        return answer.balance
+    with pytest.raises(NameError, match="minimum_balance"):
+        run_model([model_typo], {THIS_MODULE: {balance_of: lambda account: [Account(3)]}})(lambda: balance_of(None))
+
+
+def test_a_kind_that_runs_python_to_check_is_asked_in_a_try():
+    # isinstance() of an ABC may raise: a value whose kind can't be asked is none of the kinds
+    with pytest.raises(BrokenVariant, match=r"drew 3 at value = magic\(Shaped\) .*which is not Shaped") as broken:
+        run_model([model_shaped], {THIS_MODULE: {shaped: lambda: [3]}})(lambda: shaped())
+    assert isinstance(broken.value.__cause__, TypeError)
+    source = compiled([model_shaped], Compilation.MODEL_CHECKER)
+    assert "    try:\n        assert isinstance(value, Shaped)" in source
+    assert "    except (AttributeError, TypeError):\n        assert False, BrokenVariant(" in source
+    # a class that runs no Python to check stays a plain check
+    assert "try:" not in compiled(models, Compilation.MODEL_CHECKER, "random")
+
+
+def test_a_model_can_name_its_variables_as_it_likes():
+    # nothing the compiled constraint needs is named, so a variable a nested function reads stays the model's
+    def model_closing(a, b):
         _holds = magic(int)
+        def drawn():
+            return _holds
         constraint(a <= _holds <= b)
-        return _holds
+        return drawn()
     from PyMagic.compile import compile_function
-    with pytest.raises(UncompilableModel, match="uses _holds"):
-        compile_function(model__holds, random.randint, Compilation.MODEL_CHECKER, True)
+    node = compile_function(model_closing, random.randint, Compilation.MODEL_CHECKER, True)[0]
+    namespace = {"magic": lambda *kinds: 3, "BrokenVariant": BrokenVariant}
+    exec(ast.unparse(ast.fix_missing_locations(node)), namespace)
+    assert namespace["randint"](1, 6) == 3
+
+
+def test_the_names_compiled_code_needs_are_found_in_closures_not_in_attributes():
+    from PyMagic.compile import compile_function
+    def model_reads_result(a, b):
+        x = magic(int)
+        def later():
+            return _result  # noqa: F821, the name concrete code gives the real result
+        return x
+    with pytest.raises(UncompilableModel, match=r"uses \['_result'\]"):
+        compile_function(model_reads_result, random.randint, Compilation.CONCRETE)
+    def model_reads_an_attribute(a, b):
+        x = magic(int)
+        constraint(a <= x <= getattr(builtins, "_result", b))
+        return x
+    compile_function(model_reads_an_attribute, random.randint, Compilation.CONCRETE)
 
 
 def test_raising_concretely_the_checks_raise_assertion_errors():
@@ -1762,3 +1890,14 @@ def test_compile_places_what_a_c_module_defines_in_it():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_a_pure_package_takes_magic_from_the_runtimes_oracle_where_there_is_one(run_package, tmp_path):
+    # where the runtime has an oracle module (the Lean semantics' _pymagic_oracle), magic() is its draw; elsewhere
+    # the import fails and magic() is what the model checker supplies, as in the test above
+    files = compile_models(models, Compilation.MODEL_CHECKER, pure=True)
+    assert ORACLE_IMPORT in files["random.py"]
+    assert ORACLE_IMPORT not in files["_pymagic.py"]  # it calls no magic()
+    script = ("import sys, types\noracle = types.ModuleType('_pymagic_oracle')\noracle.draw = lambda *kinds: 5\n"
+              "sys.modules['_pymagic_oracle'] = oracle\nfrom compiled.random import randint\nprint(randint(1, 6))")
+    assert run_package(files, script, pure=True).split() == ["5"]
