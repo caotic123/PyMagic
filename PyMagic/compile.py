@@ -17,8 +17,8 @@ from collections import deque
 from inspect import Parameter, signature, isclass, unwrap, findsource
 
 from .model import (
-    BrokenVariant, Model, code_objects, constraint, get_models, magic, model, model_members, name_of, named_only,
-    signature_of,
+    BrokenVariant, Model, asks_any_object, code_objects, constraint, get_models, kindless_magic, magic, model,
+    model_members, name_of, named_only, resolve, signature_of,
 )
 from .specs import ConditionalPropertyRaise, SpecPropertyInvalid, always, exists, need
 
@@ -45,14 +45,31 @@ PURE_CHECKER_HEADER = ("# compiled from PyMagic models for a model checker, whic
 SPEC_HEADER = ("# arguments a spec's need() rules out raise a ConditionalPropertyRaise, and a counterexample to its always() "
                "a SpecPropertyInvalid")
 
+# in a package compiled to run in pure Python for a model checker, a module that calls magic() takes it from the
+# runtime's oracle module where there is one (the Lean semantics' _pymagic_oracle, whose draw is the hole the
+# theorem's oracle fills); elsewhere the import fails and magic() is what the model checker supplies, e.g. in builtins
+ORACLE_IMPORT = ("try:\n"
+                 "    from _pymagic_oracle import draw as magic\n"
+                 "except ImportError:\n"
+                 "    pass  # a model checker supplies magic() otherwise")
+
+def calls_magic(source):
+    # whether the module calls magic() without binding the name itself
+    tree = ast.parse(source)
+    bound = {target.id for node in ast.walk(tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
+             for target in (node.targets if isinstance(node, ast.Assign) else [node.target]) if isinstance(target, ast.Name)}
+    bound |= {alias.asname or alias.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))
+              for alias in node.names}
+    bound |= {node.name for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+    called = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "magic"
+                 for node in ast.walk(tree))
+    return called and "magic" not in bound
+
 # the PyMagic objects the compiled code names: a model checker's package has them in its _pymagic module
 COMPILER_NAMES = {
     "BrokenVariant": BrokenVariant, "ConditionalPropertyRaise": ConditionalPropertyRaise,
     "SpecPropertyInvalid": SpecPropertyInvalid,
 }
-
-# the name the compiled code of a pure package gives a constraint's condition
-HOLDS = "_holds"
 
 # names the compiled code of a spec gives a need()'s condition, and the ConditionalPropertyRaise of another spec
 SPEC_NAMES = {"_met", "_unmet"}
@@ -125,17 +142,6 @@ def function_node(func):
             if min([node.lineno] + [decorator.lineno for decorator in node.decorator_list]) == code.co_firstlineno:
                 return node
     raise UncompilableModel(f"the definition of {func.__qualname__} was not found in its source to compile it")
-
-def resolve(func, expression):
-    # the object a name or dotted name in func's code refers to at module level, or None
-    match expression:
-        case ast.Name(id=name):
-            return func.__globals__.get(name, getattr(builtins, name, None))
-        case ast.Attribute(value=owner, attr=attribute):
-            owner = resolve(func, owner)
-            return None if owner is None else getattr(owner, attribute, None)
-        case _:
-            return None
 
 def reference_to(original):
     # (module to import, source text) that refers to original from the compiled module
@@ -275,6 +281,21 @@ def kind_test(name, kinds):
 def raise_unless(condition, exception):
     # `if not condition: raise exception`
     return ast.If(ast.UnaryOp(ast.Not(), condition), [ast.Raise(exception, None)], [])
+
+def asking(statements, unasked):
+    # statements in a try that runs unasked when they ask a value something it doesn't have, raising an
+    # AttributeError or a TypeError; any other error goes through, and unasked raises with that one as its context
+    kinds = ast.Tuple([ast.Name("AttributeError", ast.Load()), ast.Name("TypeError", ast.Load())], ast.Load())
+    return ast.Try(statements, [ast.ExceptHandler(kinds, None, unasked)], [], [])
+
+def names_in(node):
+    # every name a definition's code reads or binds, in the functions nested in it too, but not attribute names
+    return {name.id for name in ast.walk(node) if isinstance(name, ast.Name)} | bound_names(node)
+
+def runs_python_to_check(kind):
+    # whether isinstance() of kind runs Python code, which may raise: an ABC's, a protocol's, a metaclass's own
+    # __instancecheck__; or kind isn't a class known when compiling
+    return not isinstance(kind, type) or type(kind) is not type
 
 def rebinds(node, name, magic_statement):
     # whether the model's own code binds name anywhere besides its `name = magic()` statement
@@ -442,12 +463,15 @@ def calls(func, node, target):
 class ModelCompiler(ast.NodeTransformer):
     # one pass over a model function's code, compiling each magic(), constraint(), return and raise it meets:
     # constraint(c) becomes `assert c` everywhere, flagged with a BrokenVariant for a model checker, or, raising, as
-    # in a pure package, `if not c: raise BrokenVariant(...)`; concrete compilation also rewrites the magic(), return
-    # and raise in the model's own scope for its concretion, leaving nested functions and classes alone
-    def __init__(self, func, name, compilation, concretion=None, result=None, raises=False):
+    # in a pure package, `if not c: raise BrokenVariant(...)`. When c reads a value of magic() of no kind, any object,
+    # that is in a try, which breaks the constraint too when c can't be asked of the values, as at run time.
+    # Concrete compilation also rewrites the magic(), return and raise in the model's own scope for its concretion,
+    # leaving nested functions and classes alone
+    def __init__(self, func, name, compilation, concretion=None, result=None, raises=False, kindless=frozenset()):
         self.func, self.name, self.compilation = func, name, compilation
         self.concretion, self.result = concretion, result
         self.raises = raises
+        self.kindless = kindless  # the variables of magic() of no kind
         self.constraints = []  # assertions to run right after the real call
         self.nested = 0
 
@@ -456,6 +480,12 @@ class ModelCompiler(ast.NodeTransformer):
         if not self.raises:
             return ast.Assert(condition, flag)
         return raise_unless(condition, flag or ast.Name("AssertionError", ast.Load()))
+
+    def broken(self, flag):
+        # what a check runs when its condition can't be asked: it fails, as it does when the condition is false
+        if not self.raises:
+            return [ast.Assert(ast.Constant(False), flag)]
+        return [ast.Raise(flag or ast.Name("AssertionError", ast.Load()), None)]
 
     def flag(self, *parts):
         # the BrokenVariant a constraint's assert fails with for a model checker; concretely, the values are the
@@ -501,19 +531,10 @@ class ModelCompiler(ast.NodeTransformer):
             )
         condition = statement.value.args[0]
         flag = self.flag(f"the values broke {ast.unparse(condition)}")
-        if self.raises and self.compilation is Compilation.MODEL_CHECKER:
-            return self.holding(self.visit(condition), flag)
+        asks_any = asks_any_object(condition, self.kindless, self.is_magic)
         # the condition alone is visited: concretely, the raise of a check isn't the model's own
-        return self.check(self.visit(condition), flag)
-
-    def holding(self, condition, flag):
-        # a constraint of a pure package: values the condition can't even be asked of break it, as those it is false
-        # of do. A checker's magic() is any object at all, one without the attribute the condition reads too, so
-        # `_holds` is the condition, or False when asking it raises an Exception; a BrokenVariant goes through
-        holds = lambda value: ast.Assign([ast.Name(HOLDS, ast.Store())], value)
-        asked = ast.IfExp(condition, ast.Constant(True), ast.Constant(False))
-        unasked = ast.ExceptHandler(ast.Name("Exception", ast.Load()), None, [holds(ast.Constant(False))])
-        return [ast.Try([holds(asked)], [unasked], [], []), raise_unless(ast.Name(HOLDS, ast.Load()), flag)]
+        checked = self.check(self.visit(condition), flag)
+        return asking([checked], self.broken(flag)) if asks_any else checked
 
     def kind_check(self, name, kinds):
         # magic(kinds)'s check of its value, as an assert
@@ -522,7 +543,10 @@ class ModelCompiler(ast.NodeTransformer):
         expected = " or ".join(map(ast.unparse, kinds))
         flag = self.flag(f"{name} = magic({', '.join(map(ast.unparse, kinds))}) drew ", ast.Name(name, ast.Load()),
                          f", which is not {expected}")
-        return [self.check(kind_test(name, kinds), flag)]
+        checked = self.check(kind_test(name, kinds), flag)
+        if any(runs_python_to_check(resolve(self.func, kind)) for kind in kinds):
+            return [asking([checked], self.broken(flag))]  # a value whose kind can't be asked is none of them
+        return [checked]
 
     def visit_Assign(self, statement):
         # name = magic(kinds), which is magic() followed by constraint(isinstance(name, kinds))
@@ -593,12 +617,8 @@ def compile_function(func, original, compilation, raises=False):
     node.decorator_list = []
     node.name = original.__name__
     if compilation is Compilation.MODEL_CHECKER:
-        used = {name for code in code_objects(func.__code__) for name in code.co_varnames + code.co_names}
-        if raises and HOLDS in used:
-            raise UncompilableModel(
-                f"{func.__qualname__} uses {HOLDS}, which the compiled code of a constraint needs; rename it"
-            )
-        node.body = ModelCompiler(func, node.name, compilation, raises=raises).compile(node.body)
+        kindless = kindless_magic(node, lambda call: calls(func, call, magic))
+        node.body = ModelCompiler(func, node.name, compilation, raises=raises, kindless=kindless).compile(node.body)
         return node, set(), None
     return compile_concrete(func, original, node, raises)
 
@@ -617,7 +637,8 @@ def compile_concrete(func, original, node, raises=False):
     # the real effect as the compiled module finds it on import, before the model is put in its place
     real_call = ast.Call(ast.Name(f"_real_{node.name}", ast.Load()), *passed_on(node.args))
 
-    compiler = ModelCompiler(func, node.name, Compilation.CONCRETE, raises=raises)
+    kindless = kindless_magic(node, lambda call: calls(func, call, magic))
+    compiler = ModelCompiler(func, node.name, Compilation.CONCRETE, raises=raises, kindless=kindless)
     magic_calls = [call for call in ast.walk(node) if compiler.is_magic(call)]
     magic_statements = [(statement, magic_variable(statement, compiler.is_magic)) for statement in node.body]
     magic_statements = [(statement, name) for statement, name in magic_statements if name is not None]
@@ -625,8 +646,7 @@ def compile_concrete(func, original, node, raises=False):
         raise UncompilableModel(
             f"{func.__qualname__} has no return to match against the result of the real {name_of(original)}"
         )
-    used_names = {name for code in code_objects(func.__code__) for name in code.co_varnames + code.co_names}
-    if taken := sorted(used_names & CONCRETE_NAMES):
+    if taken := sorted(names_in(node) & CONCRETE_NAMES):
         raise UncompilableModel(
             f"{func.__qualname__} uses {taken}, which the compiled code needs for the real result; rename them"
         )
@@ -730,13 +750,34 @@ class SpecCompiler(ast.NodeTransformer):
                 between += as_list(self.visit(statement))
         return compiled + ([self.relying(between)] if reaching else between)
 
+    def asks(self, condition):
+        # whether asking the condition may ask the arguments something they don't have: it does anything but
+        # read names and constants, join them with and, or and not, and check them with isinstance() or issubclass()
+        for node in ast.walk(condition):
+            match node:
+                case ast.Name() | ast.Constant() | ast.Tuple() | ast.BoolOp() | ast.And() | ast.Or() | ast.Not() | ast.Load():
+                    continue
+                case ast.UnaryOp(op=ast.Not()):
+                    continue
+                case ast.Call(func=ast.Name(id="isinstance" | "issubclass")) if self.is_plain(node.func):
+                    continue
+            return True
+        return False
+
     def need(self, call):
+        # arguments the condition can't be asked of are ruled out too, as those it is false of are, and as they are
+        # when the spec runs
         condition = self.condition(call, "need")
         message = f"the arguments don't meet need({ast.unparse(condition)}): {self.name} says nothing of them"
+        unmet = [ast.Raise(ast.Call(ast.Name("ConditionalPropertyRaise", ast.Load()), [ast.Constant(message)], []), None)]
+        asks = self.asks(condition)
         if not self.reaches_other_code(condition):
-            return [raising(self.visit(condition), "ConditionalPropertyRaise", message)]
-        met = ast.Assign([ast.Name("_met", ast.Store())], self.visit(condition))
-        return [self.relying([met]), raising(ast.Name("_met", ast.Load()), "ConditionalPropertyRaise", message)]
+            checked = raising(self.visit(condition), "ConditionalPropertyRaise", message)
+            return [asking([checked], unmet)] if asks else [checked]
+        met = self.relying([ast.Assign([ast.Name("_met", ast.Store())], self.visit(condition))])
+        if asks:
+            met.handlers += asking([], unmet).handlers
+        return [met, raising(ast.Name("_met", ast.Load()), "ConditionalPropertyRaise", message)]
 
     def visit_Expr(self, statement):
         # always(c) as a statement; need(c) anywhere but the spec's own body
@@ -786,10 +827,9 @@ def compile_spec(func):
             f"{func.__qualname__} uses {list(func.__code__.co_freevars)} from the function around it, which the "
             f"compiled module can't see; move them to module level"
         )
-    used = {name for code in code_objects(func.__code__) for name in code.co_varnames + code.co_names}
-    if taken := sorted(used & SPEC_NAMES):
-        raise UncompilableModel(f"{func.__qualname__} uses {taken}, which the compiled code of a spec needs; rename them")
     node = function_node(func)
+    if taken := sorted(names_in(node) & SPEC_NAMES):
+        raise UncompilableModel(f"{func.__qualname__} uses {taken}, which the compiled code of a spec needs; rename them")
     node.decorator_list = []
     node.body = SpecCompiler(func, node).compile(node.body)
     return node
@@ -1649,6 +1689,8 @@ class Package:
         for name, module in sorted(self.modules.items()):
             heading = f"{header}\n{SPEC_HEADER}" if name in self.spec_homes else header
             parts = [heading, *sorted(module.imports), *("\n\n" + block for block in [*sorted(module.helpers), *module.blocks])]
+            if self.pure and self.checker and calls_magic("\n".join(parts)):
+                parts.insert(1 + len(module.imports), "\n" + ORACLE_IMPORT)
             files[module_file(name, packages)] = "\n".join(parts) + "\n"
         for name in sorted(packages - set(self.modules)):
             files[module_file(name, packages)] = PACKAGE_INIT

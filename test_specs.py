@@ -406,6 +406,8 @@ def needs_a_big_successor(x):
         _met = witness_succ_exists(x).witness > 5
     except ConditionalPropertyRaise as _unmet:
         raise SpecPropertyInvalid(f'needs_a_big_successor relies on what another spec says nothing of: {_unmet}') from _unmet
+    except (AttributeError, TypeError):
+        raise ConditionalPropertyRaise("the arguments don't meet need(witness_succ_exists(x).witness > 5): needs_a_big_successor says nothing of them")
     if not _met:
         raise ConditionalPropertyRaise("the arguments don't meet need(witness_succ_exists(x).witness > 5): needs_a_big_successor says nothing of them")
     if not x >= 5:
@@ -598,6 +600,38 @@ def test_specs_of_two_modules_sharing_a_helper_dont_import_each_other(tmp_path, 
     assert "spec_a" not in files["spec_b.py"]
     script = "from compiled.spec_a import outer\nfrom compiled.spec_b import inner\nouter(1)\ninner(2)\nprint('held')"
     assert run_package(files, script, pure=True).split() == ["held"]
+
+
+class Account:
+    def __init__(self, balance):
+        self.balance = balance
+
+
+@spec
+def a_positive_balance_grows(account):
+    need(account.balance >= 0)
+    always(account.balance + 1 > 0)
+
+
+def test_a_need_that_cant_be_asked_rules_the_arguments_out(run_package):
+    # 5 has no balance: the spec says nothing of it, as of a negative one
+    checked = a_positive_balance_grows.forall(account=[Account(3), Account(-1), 5])
+    assert [account.balance for (account,) in checked.held] == [3] and checked.unmet[1] == (5,)
+    with pytest.raises(ConditionalPropertyRaise, match=r"^a_positive_balance_grows\(5\) doesn't meet "
+                                                       r"need\(account.balance >= 0\) .*which can't be asked of them") as unmet:
+        a_positive_balance_grows(5)
+    assert isinstance(unmet.value.__cause__, AttributeError)
+    # compiled, alike
+    files = compile_models([a_positive_balance_grows], Compilation.MODEL_CHECKER, pure=True)
+    script = (
+        "from compiled._pymagic import ConditionalPropertyRaise\nfrom compiled.test_specs import a_positive_balance_grows\n"
+        "try:\n    a_positive_balance_grows(5)\nexcept ConditionalPropertyRaise as error:\n"
+        "    print(error, '|', type(error.__context__).__name__)\n"
+    )
+    assert run_package(files, script, pure=True).splitlines() == [
+        "the arguments don't meet need(account.balance >= 0): a_positive_balance_grows says nothing of them | "
+        "AttributeError",
+    ]
 
 
 def test_what_a_spec_compiles_from():

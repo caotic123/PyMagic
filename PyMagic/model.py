@@ -1,16 +1,19 @@
 # models and the @model decorator: what a model is, the magic() values it draws and the constraint() calls
 # that reject the calls its original couldn't make
 
+import ast
 import dis
 import sys
 import types
+import builtins
+import textwrap
 import linecache
 import functools
 import dataclasses
 from enum import Enum, auto
 from typing import Any, Iterator
 from contextvars import ContextVar
-from inspect import signature, isroutine, isclass, unwrap
+from inspect import signature, isroutine, isclass, unwrap, getsourcelines
 
 
 # ------------------------------------------------------------------ errors
@@ -292,11 +295,15 @@ def magic(*kinds):
             values = iterators[name]
 
     value = as_copy(swap(values, call, place))
-    if kinds and not isinstance(value, kinds):
+    try:
+        of_kind, asking = not kinds or isinstance(value, kinds), None
+    except (AttributeError, TypeError) as error:
+        of_kind, asking = False, error  # a value whose kind can't even be asked is none of them
+    if not of_kind:
         raise BrokenVariant(
-            f"{call} drew {value!r} at {place}, which is not {' or '.join(map(kind_name, kinds))}: "
+            f"{call} drew {shown(value)} at {place}, which is not {' or '.join(map(kind_name, kinds))}: "
             f"the model of {name_of(call.original)} rejected this call"
-        )
+        ) from asking
     return value
 
 def source_at(frame, default):
@@ -304,6 +311,74 @@ def source_at(frame, default):
     # default for the line when its source isn't available
     source = linecache.getline(frame.f_code.co_filename, frame.f_lineno).strip() or default
     return f"{source} ({frame.f_code.co_filename}:{frame.f_lineno})"
+
+# ------------------------------------------------------------------ conditions that can't be asked
+
+def resolve(func, expression):
+    # the object a name or dotted name in func's code refers to at module level, or None
+    match expression:
+        case ast.Name(id=name):
+            return func.__globals__.get(name, getattr(builtins, name, None))
+        case ast.Attribute(value=owner, attr=attribute):
+            owner = resolve(func, owner)
+            return None if owner is None else getattr(owner, attribute, None)
+        case _:
+            return None
+
+def kindless_magic(tree, is_magic):
+    # the variables a model's code assigns straight from a magic() of no kind: their values are any object at all
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and is_magic(node.value) and not node.value.args:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names |= {name.id for target in targets for name in ast.walk(target) if isinstance(name, ast.Name)}
+    return names
+
+def asks_any_object(condition, kindless, is_magic):
+    # whether a condition reads a value of magic() of no kind, any object, which it may not even be asked of
+    return any(
+        isinstance(node, ast.Name) and node.id in kindless or is_magic(node) and not node.args
+        for node in ast.walk(condition)
+    )
+
+@functools.lru_cache(maxsize=None)
+def check_lines(func, target):
+    # {line: whether its condition reads any object} for each target() statement, constraint() or need(), in the
+    # source of func and the functions nested in it, or {} when its source isn't available
+    try:
+        lines, first = getsourcelines(func)
+        tree = ast.parse(textwrap.dedent("".join(lines)))
+    except (OSError, TypeError, SyntaxError):
+        return {}
+    is_magic = lambda node: isinstance(node, ast.Call) and resolve(func, node.func) is magic
+    kindless = kindless_magic(tree, is_magic)
+    found = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) and node.value.args and \
+                resolve(func, node.value.func) is target:
+            asks = asks_any_object(node.value.args[0], kindless, is_magic)
+            for line in range(node.lineno, node.end_lineno + 1):
+                found[first + line - 1] = asks
+    return found
+
+def unasked(func, traceback, target, any_object_only):
+    # where func's own code was asking the condition of a target() statement when the error of traceback was raised,
+    # `constraint(x.balance >= 0) (bank.py:12)`, or None: the innermost of func's frames must be on such a
+    # statement, one whose condition reads any object if any_object_only
+    func = unwrap(func)
+    codes = set(code_objects(func.__code__))
+    innermost = None
+    while traceback is not None:
+        if traceback.tb_frame.f_code in codes:
+            innermost = traceback
+        traceback = traceback.tb_next
+    if innermost is None:
+        return None
+    asks = check_lines(func, target).get(innermost.tb_lineno)
+    if asks is None or any_object_only and not asks:
+        return None
+    filename = innermost.tb_frame.f_code.co_filename
+    return f"{linecache.getline(filename, innermost.tb_lineno).strip()} ({filename}:{innermost.tb_lineno})"
 
 def constraint(condition):
     # the magic values drawn so far must make the condition true, otherwise the call is not one the
@@ -371,6 +446,16 @@ def stand_in(func, original, original_signature, magic_generator):
         token = running_models.set(running_models.get() + (call,))
         try:
             return func(*args, **kwargs)
+        except (AttributeError, TypeError) as error:
+            # a constraint that reads a value of magic() of no kind, any object, can't be asked of one without what
+            # it asks for: such a value breaks it, as one it is false of does
+            where = unasked(func, error.__traceback__, constraint, any_object_only=True)
+            if where is None:
+                raise
+            raise BrokenVariant(
+                f"{call} drew {call.drawn} and broke {where}, which can't be asked of them: the model of "
+                f"{name_of(original)} rejected this call"
+            ) from error
         finally:
             running_models.reset(token)
 
