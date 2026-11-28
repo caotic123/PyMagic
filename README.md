@@ -202,6 +202,54 @@ Checked(held=[(0,), (1,), (2,)], unmet=[(-1,)])
 RunningUnstatedModel: checking rolls_show_faces(n=2): randint(1, 6) ran out of magic values at face = magic(int) (dice.py:20); its magic generator stopped before giving one (use itertools.cycle([...]) to repeat values)
 ```
 
+### A spec always terminates
+
+A spec must end on every case it speaks of: for every argument its `need()`s let through, and every value the
+models' `magic()` can draw, the spec and the code it runs must finish. A proof of a spec says so: every such run
+ends, within a bound on each loop that the proof itself gives, and holds. A run that never ends is not a case the
+spec says nothing of. It is a run the proof cannot cover, so a spec over code that can loop forever cannot be
+proved, and it is not disproved either: the result is that the code may not terminate.
+
+Code that waits on an effect is the usual way to loop forever. Here `get()` is modelled to raise `ConnectionError`
+or return a page, drawing which on each call, so a draw of errors that never stops keeps `fetch()` retrying:
+
+```python
+def fetch():
+    while True:
+        try:
+            return get()
+        except ConnectionError:
+            pass
+
+
+@spec
+def fetch_gives_a_page():
+    always(isinstance(fetch(), str))  # can't be proved: every get() may fail
+```
+
+The spec has to bound the waiting itself, by speaking only of runs that end: give the code its bound as an
+argument, and `need()` it.
+
+```python
+def fetch(attempts):
+    for _ in range(attempts):
+        try:
+            return get()
+        except ConnectionError:
+            pass
+    return None
+
+
+@spec
+def fetch_gives_a_page_or_none(attempts):
+    need(isinstance(attempts, int) and 0 <= attempts <= 5)
+    page = fetch(attempts)
+    always(page is None or isinstance(page, str))
+```
+
+`run_spec` does not look for this: it runs the spec as Python runs it. With finite magics a run that loops ends in
+`RunningUnstatedModel` when they run out, and with `itertools.cycle([...])` it keeps going.
+
 ### There exists
 
 `exists(property, witness)` shows that some value has a property by giving one that does. It keeps the
