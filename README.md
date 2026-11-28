@@ -406,7 +406,7 @@ class BrokenVariant(BaseException):
 
 def randint(a, b):
     face = magic(int)
-    assert isinstance(face, int), BrokenVariant(f'face = magic(int) drew {face!r}, which is not int: the model of randint rejected this call')
+    assert isinstance(face, int), BrokenVariant(f'face = magic(int) drew a {type(face).__name__}, which is not int: the model of randint rejected this call')
     assert a <= face <= b, BrokenVariant('the values broke a <= face <= b: the model of randint rejected this call')
     return face
 ```
@@ -493,7 +493,7 @@ Its constraints are raises, not asserts, so that a broken one raises the `Broken
 def randint(a, b):
     face = magic(int)
     if not isinstance(face, int):
-        raise BrokenVariant(f'face = magic(int) drew {face!r}, which is not int: the model of randint rejected this call')
+        raise BrokenVariant(f'face = magic(int) drew a {type(face).__name__}, which is not int: the model of randint rejected this call')
     if not a <= face <= b:
         raise BrokenVariant('the values broke a <= face <= b: the model of randint rejected this call')
     return face

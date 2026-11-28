@@ -14,6 +14,7 @@ import importlib.util
 import importlib.machinery
 from enum import Enum, auto
 from collections import deque
+from typing import NamedTuple
 from inspect import Parameter, signature, isclass, unwrap, findsource
 
 from .model import (
@@ -367,11 +368,22 @@ def raised_types(node, func):
             raised.setdefault(ast.unparse(exception), exception)
     return list(raised.values())
 
+class Shown(NamedTuple):
+    # an expression an f-string shows with str(), not repr()
+    expression: ast.expr
+
 def f_string(*parts):
-    # an f-string of text and !r-formatted expressions
+    # an f-string of text, !r-formatted expressions, and Shown ones
     return ast.JoinedStr([
-        ast.Constant(part) if isinstance(part, str) else ast.FormattedValue(part, ord("r"), None) for part in parts
+        ast.Constant(part) if isinstance(part, str)
+        else ast.FormattedValue(part.expression, -1, None) if isinstance(part, Shown)
+        else ast.FormattedValue(part, ord("r"), None)
+        for part in parts
     ])
+
+def type_name(name):
+    # `type(name).__name__`
+    return ast.Attribute(ast.Call(ast.Name("type", ast.Load()), [ast.Name(name, ast.Load())], []), "__name__", ast.Load())
 
 def broken_variant(*parts):
     # `BrokenVariant(f"...")`, the message of a constraint's assert in a module compiled for a model checker
@@ -541,7 +553,9 @@ class ModelCompiler(ast.NodeTransformer):
         if not kinds:
             return []
         expected = " or ".join(map(ast.unparse, kinds))
-        flag = self.flag(f"{name} = magic({', '.join(map(ast.unparse, kinds))}) drew ", ast.Name(name, ast.Load()),
+        # the drawn value's type, not its repr: a repr runs the value's own code (a float's goes through dtoa), and
+        # every proof about the compiled package must then show that code ends, for every value a hole can hold
+        flag = self.flag(f"{name} = magic({', '.join(map(ast.unparse, kinds))}) drew a ", Shown(type_name(name)),
                          f", which is not {expected}")
         checked = self.check(kind_test(name, kinds), flag)
         if any(runs_python_to_check(resolve(self.func, kind)) for kind in kinds):

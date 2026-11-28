@@ -840,7 +840,7 @@ def test_magic_of_several_kinds():
 def checked(name, kinds, function, indent="    "):
     # the assert of magic(kinds)'s value in a module compiled for a model checker, flagged with a BrokenVariant
     kind = f"({kinds})" if ", " in kinds else kinds
-    return (f"{indent}assert isinstance({name}, {kind}), BrokenVariant(f'{name} = magic({kinds}) drew {{{name}!r}}, "
+    return (f"{indent}assert isinstance({name}, {kind}), BrokenVariant(f'{name} = magic({kinds}) drew a {{type({name}).__name__}}, "
             f"which is not {kinds.replace(', ', ' or ')}: the model of {function} rejected this call')\n")
 
 
@@ -973,7 +973,7 @@ def test_model_checker_source_runs_with_a_supplied_magic():
     assert isinstance(broken.value.args[0], namespace["BrokenVariant"])
     assert str(broken.value) == "the values broke min <= x <= max: the model of randint rejected this call"
     namespace["magic"] = lambda kind: "4"
-    with pytest.raises(AssertionError, match="x = magic\\(int\\) drew '4', which is not int") as broken:
+    with pytest.raises(AssertionError, match="x = magic\\(int\\) drew a str, which is not int") as broken:
         namespace["randint"](1, 6)
     assert isinstance(broken.value.args[0], namespace["BrokenVariant"])
 
@@ -1129,7 +1129,7 @@ PURE_HEADER = (
 
 def raised_unless_kind(name, kinds, function):
     # the raise of magic(kinds)'s value of the wrong kind, in a pure package
-    return (f"    if not isinstance({name}, {kinds}):\n        raise BrokenVariant(f'{name} = magic({kinds}) drew {{{name}!r}}, "
+    return (f"    if not isinstance({name}, {kinds}):\n        raise BrokenVariant(f'{name} = magic({kinds}) drew a {{type({name}).__name__}}, "
             f"which is not {kinds}: the model of {function} rejected this call')\n")
 
 def raised_unless(condition, function):
